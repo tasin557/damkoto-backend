@@ -192,7 +192,21 @@ async def classify_and_reply(comment_text: str, seller_id: str, customer_id: str
 
     system_prompt = build_system_prompt(catalog, settings["reply_tone"], settings["reply_language"])
 
-    messages = conversation_history + [{"role": "user", "content": comment_text}]
+    # If language changed from what history was in, limit history to avoid language confusion
+    lang = settings["reply_language"]
+    if lang != "bangla":
+        # Only keep last 2 messages to reduce Bangla pattern influence
+        conversation_history = conversation_history[-2:] if len(conversation_history) > 2 else conversation_history
+    
+    # Add language enforcement reminder to the user message
+    if lang == "english":
+        enhanced_text = f"{comment_text}\n\n[IMPORTANT: Reply ONLY in English. Not Bangla.]"
+    elif lang == "mixed":
+        enhanced_text = f"{comment_text}\n\n[Reply in Banglish - mix of Bangla and English]"
+    else:
+        enhanced_text = comment_text
+
+    messages = conversation_history + [{"role": "user", "content": enhanced_text}]
 
     fixed_messages = []
     for msg in messages:
@@ -293,6 +307,40 @@ async def get_or_create_customer(seller_id: str, facebook_user_id: str) -> str |
         return None
 
 
+async def detect_and_create_order(seller_id: str, customer_id: str, customer_name: str, incoming_text: str, reply_text: str):
+    """Use Claude to detect if the reply confirms an order. If so, create an order record."""
+    try:
+        detection = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            system="You detect if an order was confirmed in a conversation. Reply ONLY in this exact JSON format, nothing else. No markdown, no backticks.\n{\"is_order\": true/false, \"product_name\": \"...\", \"amount\": number_or_0, \"customer_name\": \"...\"}",
+            messages=[
+                {"role": "user", "content": f"Customer message: {incoming_text}\n\nShop reply: {reply_text}\n\nWas an order confirmed in the shop's reply? Extract product name, amount, and customer name if available."}
+            ]
+        )
+        
+        import json
+        result_text = detection.content[0].text.strip()
+        # Clean up any markdown formatting
+        result_text = result_text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(result_text)
+        
+        if result.get("is_order"):
+            order_data = {
+                "seller_id": seller_id,
+                "customer_id": customer_id,
+                "status": "new",
+                "amount": result.get("amount", 0),
+                "product_name": result.get("product_name", ""),
+                "customer_name": result.get("customer_name", customer_name),
+                "notes": f"Auto-detected from chat"
+            }
+            supabase.table("orders").insert(order_data).execute()
+            print(f"Order auto-created: {order_data}")
+    except Exception as e:
+        print(f"Order detection error (non-fatal): {e}")
+
+
 async def save_messages_to_db(seller_id: str, customer_id: str, incoming_text: str, reply_text: str):
     try:
         supabase.table("messages").insert({
@@ -301,12 +349,13 @@ async def save_messages_to_db(seller_id: str, customer_id: str, incoming_text: s
             "direction": "incoming",
             "content": incoming_text
         }).execute()
-        supabase.table("messages").insert({
-            "seller_id": seller_id,
-            "customer_id": customer_id,
-            "direction": "outgoing",
-            "content": reply_text
-        }).execute()
+        if reply_text:
+            supabase.table("messages").insert({
+                "seller_id": seller_id,
+                "customer_id": customer_id,
+                "direction": "outgoing",
+                "content": reply_text
+            }).execute()
     except Exception as e:
         print(f"Error saving messages: {e}")
 
@@ -351,6 +400,10 @@ async def receive_webhook(request: Request):
                         reply = await classify_and_reply(comment_text, seller_id, customer_id)
                         await post_comment_reply(comment_id, reply)
                         await save_messages_to_db(seller_id, customer_id, comment_text, reply)
+                        # Detect if order was confirmed
+                        customer_data = supabase.table("customers").select("name").eq("id", customer_id).single().execute()
+                        cname = customer_data.data.get("name", "Unknown") if customer_data.data else "Unknown"
+                        await detect_and_create_order(seller_id, customer_id, cname, comment_text, reply)
                         print(f"Comment replied: '{comment_text}' → '{reply}'")
 
         for messaging in entry.get("messaging", []):
@@ -374,6 +427,10 @@ async def receive_webhook(request: Request):
                 reply = await classify_and_reply(comment_text, seller_id, customer_id)
                 await send_messenger_reply(sender_id, reply)
                 await save_messages_to_db(seller_id, customer_id, comment_text, reply)
+                # Detect if order was confirmed
+                customer_data = supabase.table("customers").select("name").eq("id", customer_id).single().execute()
+                cname = customer_data.data.get("name", "Unknown") if customer_data.data else "Unknown"
+                await detect_and_create_order(seller_id, customer_id, cname, comment_text, reply)
                 print(f"Messenger replied: '{comment_text}' → '{reply}'")
 
     return {"status": "ok"}
