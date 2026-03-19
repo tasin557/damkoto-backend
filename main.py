@@ -17,6 +17,33 @@ PAGE_ID = os.getenv("META_PAGE_ID")
 VERIFY_TOKEN = "damkoto_webhook_token"
 
 
+async def get_seller_settings(seller_id: str) -> dict:
+    """Fetch seller's auto-reply settings from Supabase."""
+    defaults = {
+        "bot_enabled": True,
+        "comment_reply": True,
+        "messenger_reply": True,
+        "reply_tone": "formal",
+        "reply_language": "bangla",
+    }
+    try:
+        result = supabase.table("seller_settings").select("*").eq(
+            "seller_id", seller_id).execute()
+        if result.data:
+            settings = result.data[0]
+            return {
+                "bot_enabled": settings.get("bot_enabled", True),
+                "comment_reply": settings.get("comment_reply", True),
+                "messenger_reply": settings.get("messenger_reply", True),
+                "reply_tone": settings.get("reply_tone", "formal"),
+                "reply_language": settings.get("reply_language", "bangla"),
+            }
+        return defaults
+    except Exception as e:
+        print(f"Error fetching seller settings: {e}")
+        return defaults
+
+
 async def get_product_catalog(seller_id: str) -> str:
     try:
         products = supabase.table("products").select("*").eq(
@@ -57,22 +84,60 @@ async def get_conversation_history(customer_id: str) -> list:
         return []
 
 
-async def classify_and_reply(comment_text: str, seller_id: str, customer_id: str = None) -> str:
-    catalog = await get_product_catalog(seller_id)
-    conversation_history = await get_conversation_history(customer_id)
+def build_system_prompt(catalog: str, tone: str, language: str) -> str:
+    """Build system prompt based on seller's settings."""
+    
+    # Tone instructions
+    if tone == "casual":
+        tone_instruction = 'তুমি বন্ধুসুলভ ভাবে কথা বলো। "তুমি" ব্যবহার করো। হালকা ইমোজি ব্যবহার করতে পারো।'
+        address = "তুমি"
+    else:
+        tone_instruction = 'তুমি ভদ্র ও পেশাদার ভাবে কথা বলো। সবসময় "আপনি" ব্যবহার করো।'
+        address = "আপনি"
+    
+    # Language instructions
+    if language == "english":
+        lang_instruction = "Always reply in English only. Do not use Bangla."
+        base_prompt = f"""You are a customer service assistant for a Bangladeshi F-commerce store.
 
-    system_prompt = f"""তুমি একটি বাংলাদেশি F-commerce দোকানের কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট।
+Product catalog:
+{catalog}
+
+Strict rules:
+
+1. Gender neutrality: Never use gendered terms. Always address the customer as "you".
+
+2. Complaint handling: If a customer mentions a torn, wrong color, damaged product or any issue, do NOT try to sell. Apologize first, then ask for their phone number.
+
+3. Refunds: If they ask for money back, say "Sorry for the trouble. Please share your phone number and we'll resolve this quickly." Never refuse.
+
+4. Angry customers: Stop selling. Apologize. Ask for contact info.
+
+5. Product info: Only mention products from the catalog.
+
+6. No repetition: Don't repeat the same product info more than once.
+
+7. Tone: {tone_instruction} Keep it to 1-3 sentences max. No emoji for complaints.
+
+8. Orders: Ask for name and phone number.
+
+9. Delivery: Inside Dhaka 2-3 days, outside 3-5 days.
+
+{lang_instruction}"""
+    elif language == "mixed":
+        lang_instruction = "Reply in a natural mix of Bangla and English (Banglish), like how young Bangladeshis text. Use Bangla script primarily but English words are okay."
+        base_prompt = f"""তুমি একটি বাংলাদেশি F-commerce দোকানের কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট।
 
 প্রোডাক্ট ক্যাটালগ:
 {catalog}
 
 কঠোর নিয়মাবলী:
 
-১. লিঙ্গ নিরপেক্ষতা: কখনো "ভাই" বা "আপু" বলবে না। সবসময় শুধু "আপনি" ব্যবহার করো।
+১. লিঙ্গ নিরপেক্ষতা: কখনো "ভাই" বা "আপু" বলবে না। সবসময় "{address}" ব্যবহার করো।
 
 ২. অভিযোগ হ্যান্ডেলিং: পণ্য ছেঁড়া, ভুল রঙ, নষ্ট বা কোনো সমস্যার কথা বললে পণ্য বিক্রির চেষ্টা করবে না। আগে ক্ষমা চাও, তারপর ফোন নম্বর চাও।
 
-৩. রিফান্ড: টাকা ফেরত চাইলে বলো "আপনার সমস্যার জন্য দুঃখিত। ফোন নম্বরটা দিন, আমরা দ্রুত সমাধান করবো।" কখনো অস্বীকার করবে না।
+৩. রিফান্ড: টাকা ফেরত চাইলে বলো "{address}র সমস্যার জন্য দুঃখিত। ফোন নম্বরটা দিন, আমরা দ্রুত সমাধান করবো।" কখনো অস্বীকার করবে না।
 
 ৪. রাগী কাস্টমার: রাগান্বিত হলে পণ্য বিক্রি বন্ধ করো। ক্ষমা চাও, যোগাযোগের তথ্য চাও।
 
@@ -80,13 +145,52 @@ async def classify_and_reply(comment_text: str, seller_id: str, customer_id: str
 
 ৬. পুনরাবৃত্তি নিষেধ: একই পণ্যের তথ্য একবারের বেশি দেবে না।
 
-৭. টোন: সহজ, উষ্ণ বাংলা। সর্বোচ্চ ১-৩ বাক্য। অভিযোগে ইমোজি নয়।
+৭. টোন: {tone_instruction} সর্বোচ্চ ১-৩ বাক্য। অভিযোগে ইমোজি নয়।
 
 ৮. অর্ডার করতে চাইলে: নাম ও ফোন নম্বর চাও।
 
 ৯. ডেলিভারি: ঢাকার ভেতরে ২-৩ দিন, বাইরে ৩-৫ দিন।
 
-শুধুমাত্র বাংলায় উত্তর দাও।"""
+{lang_instruction}"""
+    else:
+        # Default: Bangla
+        lang_instruction = "শুধুমাত্র বাংলায় উত্তর দাও।"
+        base_prompt = f"""তুমি একটি বাংলাদেশি F-commerce দোকানের কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট।
+
+প্রোডাক্ট ক্যাটালগ:
+{catalog}
+
+কঠোর নিয়মাবলী:
+
+১. লিঙ্গ নিরপেক্ষতা: কখনো "ভাই" বা "আপু" বলবে না। সবসময় "{address}" ব্যবহার করো।
+
+২. অভিযোগ হ্যান্ডেলিং: পণ্য ছেঁড়া, ভুল রঙ, নষ্ট বা কোনো সমস্যার কথা বললে পণ্য বিক্রির চেষ্টা করবে না। আগে ক্ষমা চাও, তারপর ফোন নম্বর চাও।
+
+৩. রিফান্ড: টাকা ফেরত চাইলে বলো "{address}র সমস্যার জন্য দুঃখিত। ফোন নম্বরটা দিন, আমরা দ্রুত সমাধান করবো।" কখনো অস্বীকার করবে না।
+
+৪. রাগী কাস্টমার: রাগান্বিত হলে পণ্য বিক্রি বন্ধ করো। ক্ষমা চাও, যোগাযোগের তথ্য চাও।
+
+৫. পণ্যের তথ্য: শুধু ক্যাটালগে থাকা পণ্যের কথা বলো।
+
+৬. পুনরাবৃত্তি নিষেধ: একই পণ্যের তথ্য একবারের বেশি দেবে না।
+
+৭. টোন: {tone_instruction} সর্বোচ্চ ১-৩ বাক্য। অভিযোগে ইমোজি নয়।
+
+৮. অর্ডার করতে চাইলে: নাম ও ফোন নম্বর চাও।
+
+৯. ডেলিভারি: ঢাকার ভেতরে ২-৩ দিন, বাইরে ৩-৫ দিন।
+
+{lang_instruction}"""
+    
+    return base_prompt
+
+
+async def classify_and_reply(comment_text: str, seller_id: str, customer_id: str = None) -> str:
+    catalog = await get_product_catalog(seller_id)
+    conversation_history = await get_conversation_history(customer_id)
+    settings = await get_seller_settings(seller_id)
+
+    system_prompt = build_system_prompt(catalog, settings["reply_tone"], settings["reply_language"])
 
     messages = conversation_history + [{"role": "user", "content": comment_text}]
 
@@ -233,6 +337,16 @@ async def receive_webhook(request: Request):
                         seller_id = await get_or_create_seller()
                         if not seller_id:
                             continue
+                        
+                        # Check if bot and comment replies are enabled
+                        settings = await get_seller_settings(seller_id)
+                        if not settings["bot_enabled"] or not settings["comment_reply"]:
+                            print(f"Comment reply disabled for seller {seller_id}")
+                            # Still save incoming message
+                            customer_id = await get_or_create_customer(seller_id, sender_id)
+                            await save_messages_to_db(seller_id, customer_id, comment_text, "")
+                            continue
+                        
                         customer_id = await get_or_create_customer(seller_id, sender_id)
                         reply = await classify_and_reply(comment_text, seller_id, customer_id)
                         await post_comment_reply(comment_id, reply)
@@ -247,6 +361,15 @@ async def receive_webhook(request: Request):
                 seller_id = await get_or_create_seller()
                 if not seller_id:
                     continue
+                
+                # Check if bot and messenger replies are enabled
+                settings = await get_seller_settings(seller_id)
+                if not settings["bot_enabled"] or not settings["messenger_reply"]:
+                    print(f"Messenger reply disabled for seller {seller_id}")
+                    customer_id = await get_or_create_customer(seller_id, sender_id)
+                    await save_messages_to_db(seller_id, customer_id, comment_text, "")
+                    continue
+                
                 customer_id = await get_or_create_customer(seller_id, sender_id)
                 reply = await classify_and_reply(comment_text, seller_id, customer_id)
                 await send_messenger_reply(sender_id, reply)
