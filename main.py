@@ -308,22 +308,27 @@ async def get_or_create_customer(seller_id: str, facebook_user_id: str) -> str |
 
 
 async def detect_and_create_order(seller_id: str, customer_id: str, customer_name: str, incoming_text: str, reply_text: str):
-    """Use Claude to detect if the reply confirms an order. If so, create an order record."""
+    """Use Claude to detect if the reply confirms an order. If so, create an order record and save phone number."""
     try:
         detection = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=200,
-            system="You detect if an order was confirmed in a conversation. Reply ONLY in this exact JSON format, nothing else. No markdown, no backticks.\n{\"is_order\": true/false, \"product_name\": \"...\", \"amount\": number_or_0, \"customer_name\": \"...\"}",
+            system="You detect if an order was confirmed in a conversation. Reply ONLY in this exact JSON format, nothing else. No markdown, no backticks.\n{\"is_order\": true/false, \"product_name\": \"...\", \"amount\": number_or_0, \"customer_name\": \"...\", \"phone\": \"...\"}",
             messages=[
-                {"role": "user", "content": f"Customer message: {incoming_text}\n\nShop reply: {reply_text}\n\nWas an order confirmed in the shop's reply? Extract product name, amount, and customer name if available."}
+                {"role": "user", "content": f"Customer message: {incoming_text}\n\nShop reply: {reply_text}\n\nWas an order confirmed in the shop's reply? Extract product name, amount, customer name, and phone number if available. If phone not found, set phone to empty string."}
             ]
         )
         
         import json
         result_text = detection.content[0].text.strip()
-        # Clean up any markdown formatting
         result_text = result_text.replace("```json", "").replace("```", "").strip()
         result = json.loads(result_text)
+        
+        # Save phone number to customer if detected
+        phone = result.get("phone", "")
+        if phone and customer_id:
+            supabase.table("customers").update({"phone": phone}).eq("id", customer_id).execute()
+            print(f"Phone saved for customer {customer_id}: {phone}")
         
         if result.get("is_order"):
             order_data = {
