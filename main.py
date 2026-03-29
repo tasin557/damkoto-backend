@@ -19,6 +19,10 @@ PAGE_ID = os.getenv("META_PAGE_ID")
 VERIFY_TOKEN = "damkoto_webhook_token"
 
 
+# ═══════════════════════════════════════════
+# DATA FETCHING FUNCTIONS
+# ═══════════════════════════════════════════
+
 async def get_product_catalog(seller_id: str) -> str:
     try:
         products = supabase.table("products").select("*").eq(
@@ -46,11 +50,9 @@ async def get_product_price(seller_id: str, product_name: str) -> float:
             "seller_id", seller_id).eq("in_stock", True).execute()
         if not products.data:
             return 0
-        # Try exact match first
         for p in products.data:
             if p["name"].lower().strip() == product_name.lower().strip():
                 return float(p["price"])
-        # Try partial match
         for p in products.data:
             if product_name.lower().strip() in p["name"].lower().strip() or \
                p["name"].lower().strip() in product_name.lower().strip():
@@ -75,7 +77,16 @@ async def get_conversation_history(customer_id: str) -> list:
         messages = []
         for msg in reversed(history.data):
             role = "user" if msg["direction"] == "incoming" else "assistant"
-            messages.append({"role": role, "content": msg["content"]})
+            content = msg["content"]
+            # Clean up any JSON that leaked into conversation history
+            # (from the previous JSON-response version)
+            if role == "assistant" and content.strip().startswith("{"):
+                try:
+                    parsed = json.loads(content)
+                    content = parsed.get("reply", content)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            messages.append({"role": role, "content": content})
         return messages
     except Exception as e:
         print(f"Error fetching conversation history: {e}")
@@ -83,7 +94,6 @@ async def get_conversation_history(customer_id: str) -> list:
 
 
 async def get_customer_orders(seller_id: str, customer_id: str) -> str:
-    """Fetch recent orders for this customer to inject into context."""
     try:
         if not customer_id:
             return "কোনো অর্ডার নেই।"
@@ -99,19 +109,19 @@ async def get_customer_orders(seller_id: str, customer_id: str) -> str:
         order_text = ""
         for o in orders.data:
             status_map = {
-                "new": "নতুন (অপেক্ষমাণ)",
+                "new": "নতুন (কনফার্মের অপেক্ষায়)",
                 "confirmed": "কনফার্মড",
                 "paid": "পেমেন্ট হয়েছে",
-                "shipped": "শিপড",
+                "shipped": "শিপড (ডেলিভারির পথে)",
                 "delivered": "ডেলিভার্ড",
+                "cancelled": "ক্যান্সেলড",
             }
             status = status_map.get(o.get("status", ""), o.get("status", ""))
             order_text += f"- অর্ডার: {o.get('product_name', 'N/A')} | "
             order_text += f"৳{o.get('amount', 0)} | "
-            order_text += f"স্ট্যাটাস: {status} | "
-            order_text += f"কাস্টমার: {o.get('customer_name', 'N/A')}"
+            order_text += f"স্ট্যাটাস: {status}"
             if o.get('notes'):
-                order_text += f" | নোট: {o['notes']}"
+                order_text += f" | {o['notes']}"
             order_text += "\n"
         return order_text
     except Exception as e:
@@ -120,14 +130,13 @@ async def get_customer_orders(seller_id: str, customer_id: str) -> str:
 
 
 async def get_delivery_settings(seller_id: str) -> str:
-    """Fetch division-level delivery settings for this seller."""
     try:
         result = supabase.table("delivery_settings").select("*").eq(
             "seller_id", seller_id
         ).eq("is_enabled", True).execute()
 
         if not result.data:
-            return "ডেলিভারি সেটিংস এখনো কনফিগার করা হয়নি। কাস্টমার ডেলিভারি চার্জ জানতে চাইলে বলো: 'দোকান থেকে শীঘ্রই জানানো হবে।'"
+            return "ডেলিভারি: ঢাকার ভেতরে ২-৩ দিন, ঢাকার বাইরে ৩-৫ দিন।"
 
         division_names = {
             "dhaka": "ঢাকা", "chittagong": "চট্টগ্রাম", "rajshahi": "রাজশাহী",
@@ -153,21 +162,18 @@ async def get_delivery_settings(seller_id: str) -> str:
 
 
 async def get_payment_settings(seller_id: str) -> str:
-    """Fetch payment method configuration for this seller."""
     try:
         result = supabase.table("payment_settings").select("*").eq(
             "seller_id", seller_id
         ).eq("is_enabled", True).execute()
 
         if not result.data:
-            return "পেমেন্ট সেটিংস এখনো কনফিগার করা হয়নি। কাস্টমার পেমেন্ট জানতে চাইলে বলো: 'দোকান থেকে শীঘ্রই পেমেন্ট ডিটেইলস জানানো হবে।'"
+            return "পেমেন্ট সেটিংস এখনো কনফিগার করা হয়নি।"
 
         type_names = {
             "cod": "ক্যাশ অন ডেলিভারি (COD)",
-            "bkash": "bKash",
-            "nagad": "Nagad",
-            "rocket": "Rocket",
-            "bank_transfer": "ব্যাংক ট্রান্সফার"
+            "bkash": "bKash", "nagad": "Nagad",
+            "rocket": "Rocket", "bank_transfer": "ব্যাংক ট্রান্সফার"
         }
 
         text = ""
@@ -182,7 +188,6 @@ async def get_payment_settings(seller_id: str) -> str:
                 text += "\n"
                 if p.get("instructions"):
                     text += f"  নির্দেশনা: {p['instructions']}\n"
-
         return text
     except Exception as e:
         print(f"Error fetching payment settings: {e}")
@@ -190,7 +195,6 @@ async def get_payment_settings(seller_id: str) -> str:
 
 
 async def get_shop_settings(seller_id: str) -> dict:
-    """Fetch shop-level settings (advance payment, free delivery, etc.)."""
     defaults = {
         "shop_name": None,
         "advance_payment_type": "none",
@@ -209,25 +213,25 @@ async def get_shop_settings(seller_id: str) -> dict:
         return defaults
 
 
+# ═══════════════════════════════════════════
+# ORDER CREATION
+# ═══════════════════════════════════════════
+
 async def create_order_from_ai(
-    seller_id: str,
-    customer_id: str,
-    order_data: dict
+    seller_id: str, customer_id: str, order_data: dict
 ) -> bool:
-    """Create an order in the database from AI-extracted data."""
     try:
         product_name = order_data.get("product_name", "")
         customer_name = order_data.get("customer_name", "")
         customer_phone = order_data.get("customer_phone", "")
         delivery_address = order_data.get("delivery_address", "")
-        amount = order_data.get("amount", 0)
-        delivery_charge = order_data.get("delivery_charge", 0)
+        amount = float(order_data.get("amount", 0))
+        delivery_charge = float(order_data.get("delivery_charge", 0))
 
-        # Try to find actual product price if amount is 0
         if not amount and product_name:
             amount = await get_product_price(seller_id, product_name)
 
-        total = float(amount) + float(delivery_charge)
+        total = amount + delivery_charge
 
         # Build notes with all customer details
         notes_parts = []
@@ -236,31 +240,62 @@ async def create_order_from_ai(
         if delivery_address:
             notes_parts.append(f"ঠিকানা: {delivery_address}")
         if delivery_charge:
-            notes_parts.append(f"ডেলিভারি: ৳{delivery_charge}")
-        notes = " | ".join(notes_parts)
+            notes_parts.append(f"ডেলিভারি: ৳{int(delivery_charge)}")
+        notes = " | ".join(notes_parts) if notes_parts else ""
 
         supabase.table("orders").insert({
             "seller_id": seller_id,
             "customer_id": customer_id,
             "customer_name": customer_name or "Unknown",
             "product_name": product_name or "Unknown",
-            "amount": total,
+            "amount": int(total),
             "status": "new",
             "notes": notes,
         }).execute()
 
-        # Also update customer phone if we got it
+        # Update customer phone if we got it
         if customer_phone and customer_id:
             supabase.table("customers").update({
                 "phone": customer_phone
             }).eq("id", customer_id).execute()
 
-        print(f"Order created: {product_name} for {customer_name} - ৳{total}")
+        print(f"ORDER CREATED: {product_name} for {customer_name} - ৳{int(total)}")
         return True
     except Exception as e:
         print(f"Error creating order: {e}")
         return False
 
+
+# ═══════════════════════════════════════════
+# MESSENGER NOTIFICATION (for status updates)
+# ═══════════════════════════════════════════
+
+async def notify_customer_status_change(
+    customer_facebook_id: str, order: dict, new_status: str
+):
+    """Send a Messenger notification to customer when order status changes."""
+    status_messages = {
+        "confirmed": f"আপনার অর্ডার ({order.get('product_name', '')}) কনফার্ম হয়েছে! 🎉 শীঘ্রই পেমেন্ট ও ডেলিভারির তথ্য জানানো হবে।",
+        "paid": f"আপনার অর্ডারের ({order.get('product_name', '')}) পেমেন্ট রিসিভ হয়েছে। ধন্যবাদ! ✅",
+        "shipped": f"আপনার অর্ডার ({order.get('product_name', '')}) শিপ করা হয়েছে! 🚚 শীঘ্রই পেয়ে যাবেন।",
+        "delivered": f"আপনার অর্ডার ({order.get('product_name', '')}) ডেলিভার হয়েছে! 📦 ধন্যবাদ আমাদের সাথে কেনাকাটার জন্য! 🙏",
+        "cancelled": f"দুঃখিত, আপনার অর্ডার ({order.get('product_name', '')}) ক্যান্সেল করা হয়েছে। কোনো প্রশ্ন থাকলে জানান। 🙏",
+    }
+
+    message = status_messages.get(new_status)
+    if not message:
+        return
+
+    try:
+        await send_messenger_reply(customer_facebook_id, message)
+        print(f"Status notification sent: {new_status} to {customer_facebook_id}")
+    except Exception as e:
+        print(f"Error sending status notification: {e}")
+
+
+# ═══════════════════════════════════════════
+# AI CLASSIFICATION & REPLY
+# ═══════════════════════════════════════════
 
 async def classify_and_reply(
     comment_text: str,
@@ -268,7 +303,6 @@ async def classify_and_reply(
     customer_id: str = None,
     customer_name: str = "Unknown"
 ) -> dict:
-    """Returns dict with 'reply_text' and optional 'order_data'."""
     catalog = await get_product_catalog(seller_id)
     conversation_history = await get_conversation_history(customer_id)
     customer_orders = await get_customer_orders(seller_id, customer_id)
@@ -276,142 +310,89 @@ async def classify_and_reply(
     payment_info = await get_payment_settings(seller_id)
     shop = await get_shop_settings(seller_id)
 
-    # Build advance payment instruction
     advance_text = ""
     if shop.get("advance_payment_type") == "full":
         advance_text = "অর্ডার কনফার্ম হলে পুরো টাকা আগে পেমেন্ট করতে হবে।"
     elif shop.get("advance_payment_type") == "partial":
         pct = shop.get("advance_percentage", 0)
-        advance_text = f"অর্ডার কনফার্ম হলে মোট মূল্যের {pct}% অ্যাডভান্স পেমেন্ট করতে হবে। বাকি টাকা ডেলিভারির সময় দিতে হবে। অ্যাডভান্স হিসাব করার সময় ভগ্নাংশ বা দশমিক সংখ্যা দেবে না — পূর্ণ সংখ্যায় রাউন্ড আপ করো।"
+        advance_text = f"অর্ডার কনফার্ম হলে মোট মূল্যের {pct}% অ্যাডভান্স পেমেন্ট করতে হবে। বাকি টাকা ডেলিভারির সময় দিতে হবে। অ্যাডভান্স সবসময় পূর্ণ সংখ্যায় রাউন্ড আপ করো।"
     else:
-        advance_text = "কোনো অ্যাডভান্স পেমেন্ট লাগবে না। ক্যাশ অন ডেলিভারি (COD) বা পেমেন্ট মেথডের মাধ্যমে পেমেন্ট করা যাবে।"
+        advance_text = "কোনো অ্যাডভান্স পেমেন্ট লাগবে না।"
 
-    # Free delivery info
     free_delivery_text = ""
     if shop.get("free_delivery_enabled") and shop.get("free_delivery_threshold", 0) > 0:
         free_delivery_text = f"৳{shop['free_delivery_threshold']} বা তার বেশি অর্ডারে ডেলিভারি ফ্রি।"
 
     shop_name = shop.get("shop_name") or "দোকান"
 
-    system_prompt = f"""তুমি "{shop_name}" এর কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট — একটি বাংলাদেশি F-commerce দোকান। তোমার কাজ হলো কাস্টমারদের সাথে বাংলায় সহজ ও বন্ধুত্বপূর্ণভাবে কথা বলা। তুমি দোকান মালিকের হয়ে কাজ করো।
+    system_prompt = f"""তুমি "{shop_name}" এর কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট — একটি বাংলাদেশি F-commerce দোকান। তুমি দোকান মালিকের হয়ে কাজ করো।
 
-═══════════════════════════════════════════
-কাস্টমারের তথ্য (ডেটাবেস থেকে — এটাই সত্য)
-═══════════════════════════════════════════
+═══ কাস্টমারের তথ্য (ডেটাবেস থেকে — এটাই সত্য) ═══
 কাস্টমারের নাম: {customer_name}
 কাস্টমারের অর্ডার হিস্ট্রি:
 {customer_orders}
 
-এই তথ্য ডেটাবেস থেকে এসেছে — এটাই সত্য। যদি অর্ডার হিস্ট্রিতে অর্ডার থাকে, তাহলে কাস্টমার আগেই অর্ডার দিয়েছে। তাকে আবার জিজ্ঞেস করো না "কী অর্ডার করতে চান?" বা "কোন পণ্য নিতে চান?"
+এই তথ্য ডেটাবেস থেকে এসেছে — এটাই সত্য। যদি অর্ডার হিস্ট্রিতে অর্ডার থাকে, তাহলে কাস্টমার আগেই অর্ডার দিয়েছে।
 
-═══════════════════════════════════════════
-প্রোডাক্ট ক্যাটালগ
-═══════════════════════════════════════════
+═══ প্রোডাক্ট ক্যাটালগ ═══
 {catalog}
 
-═══════════════════════════════════════════
-ডেলিভারি তথ্য
-═══════════════════════════════════════════
+═══ ডেলিভারি তথ্য ═══
 {delivery_info}
 {free_delivery_text}
 
-═══════════════════════════════════════════
-পেমেন্ট তথ্য
-═══════════════════════════════════════════
+═══ পেমেন্ট তথ্য ═══
 {payment_info}
 {advance_text}
 
 সতর্কতা — পেমেন্ট নম্বর:
-উপরে যে মোবাইল ব্যাংকিং নম্বর দেওয়া আছে, সেটাই কাস্টমারকে দাও। কখনো নিজে থেকে নম্বর বানিয়ে দেবে না। ভুল নম্বর দিলে কাস্টমারের টাকা অন্য কারো কাছে চলে যাবে। যদি নম্বর "N/A" বা খালি থাকে, তাহলে বলো: "দোকান থেকে পেমেন্ট ডিটেইলস জানানো হবে।"
+উপরে যে মোবাইল ব্যাংকিং নম্বর দেওয়া আছে, সেটাই কাস্টমারকে দাও। কখনো নিজে থেকে নম্বর বানিয়ে দেবে না।
 
-═══════════════════════════════════════════
-কঠোর নিয়মাবলী — এগুলো কখনো ভাঙবে না
-═══════════════════════════════════════════
+═══ কঠোর নিয়মাবলী ═══
 
 নিয়ম ১ — অর্ডার কনফার্ম করবে না:
-তোমার অর্ডার কনফার্ম করার ক্ষমতা নেই। শুধু দোকান মালিক অর্ডার কনফার্ম করতে পারে। সব তথ্য সংগ্রহ করার পরে বলো:
-"আপনার অর্ডারের তথ্য পেয়েছি! দোকান থেকে শীঘ্রই কনফার্ম করা হবে।"
-কখনো বলবে না: "অর্ডার কনফার্ম হয়েছে", "Your order is confirmed", "অর্ডার হয়ে গেছে" বা এরকম কিছু যা বোঝায় অর্ডার চূড়ান্ত হয়ে গেছে।
+শুধু দোকান মালিক অর্ডার কনফার্ম করতে পারে। বলো: "আপনার অর্ডারের তথ্য পেয়েছি! দোকান থেকে শীঘ্রই কনফার্ম করা হবে।"
+কখনো বলবে না: "অর্ডার কনফার্ম হয়েছে" বা "অর্ডার হয়ে গেছে"।
 
 নিয়ম ২ — আগের অর্ডার ভুলবে না:
-উপরের "কাস্টমারের অর্ডার হিস্ট্রি" চেক করো। যদি সেখানে অর্ডার থাকে:
-- কাস্টমারকে আবার অর্ডার দিতে বলবে না
-- কাস্টমার "আমি অর্ডার দিয়েছি" বলে তাকে বলো: "হ্যাঁ, আপনার অর্ডার প্রসেসে আছে! দোকান থেকে শীঘ্রই কনফার্ম করা হবে।"
-- কাস্টমার ডেলিভারি চার্জ বা অন্য প্রশ্ন করলে, তার অর্ডার রেফারেন্স করে উত্তর দাও
-- কখনো বলবে না "কোন পণ্য নিতে চান?" বা "What would you like to order?" যদি সে ইতিমধ্যে অর্ডার দিয়ে থাকে
-- কিন্তু কাস্টমার যদি নতুন আরেকটি প্রোডাক্ট অর্ডার করতে চায়, সেটা অনুমতি দাও।
+উপরের অর্ডার হিস্ট্রি চেক করো। অর্ডার থাকলে:
+- আবার অর্ডার দিতে বলবে না
+- "আমি অর্ডার দিয়েছি" বললে বলো: "হ্যাঁ, আপনার অর্ডার প্রসেসে আছে!"
+- অর্ডার স্ট্যাটাস জানতে চাইলে হিস্ট্রি থেকে সরাসরি স্ট্যাটাস বলো
+- নতুন প্রোডাক্ট অর্ডার করতে চাইলে সেটা অনুমতি দাও
 
-নিয়ম ৩ — অর্ডারের জন্য সব তথ্য সংগ্রহ করো:
-কাস্টমার অর্ডার করতে চাইলে, এই ৪টি তথ্য অবশ্যই সংগ্রহ করতে হবে:
-  ১) কোন প্রোডাক্ট (নাম ও ভ্যারিয়েন্ট যদি থাকে)
+নিয়ম ৩ — অর্ডারের জন্য ৪টি তথ্য সংগ্রহ করো:
+  ১) প্রোডাক্ট (নাম ও ভ্যারিয়েন্ট)
   ২) কাস্টমারের নাম
   ৩) ফোন নম্বর
-  ৪) ডেলিভারি ঠিকানা (এলাকা, রোড, বাসা নম্বর)
-কোনো তথ্য বাদ দেবে না। সব তথ্য পাওয়ার আগে "অর্ডার পেয়েছি" বলবে না।
-সব তথ্য পেলে, ডেলিভারি চার্জ হিসাব করো (ঠিকানা থেকে বিভাগ বুঝে উপরের ডেলিভারি তথ্য থেকে চার্জ নাও)।
-তারপর সারাংশ দেখাও:
-"আপনার অর্ডারের তথ্য:
-📦 প্রোডাক্ট: [নাম] — ৳[দাম]
-👤 নাম: [নাম]
-📱 ফোন: [নম্বর]
-📍 ঠিকানা: [ঠিকানা]
-🚚 ডেলিভারি: ৳[চার্জ] ([বিভাগ], [দিন])
-💰 মোট: ৳[দাম + ডেলিভারি চার্জ]
+  ৪) ডেলিভারি ঠিকানা
+সব তথ্য পাওয়ার আগে "অর্ডার পেয়েছি" বলবে না।
+সব তথ্য পেলে সারাংশ দেখাও এবং "সব ঠিক আছে? 'হ্যাঁ' বলুন।" বলো।
 
-সব ঠিক আছে? 'হ্যাঁ' বলুন।"
+নিয়ম ৪ — পেমেন্ট নম্বর সঠিকভাবে দাও। ভুল নম্বর দিলে কাস্টমারের টাকা হারাবে।
 
-কাস্টমার "হ্যাঁ" বললে বলো:
-"আপনার অর্ডারের তথ্য পেয়েছি! দোকান থেকে শীঘ্রই কনফার্ম করা হবে এবং পেমেন্টের ডিটেইলস জানানো হবে। ধন্যবাদ! 🙏"
+নিয়ম ৫ — অভিযোগে বলো: "দোকান থেকে বিষয়টি দেখা হচ্ছে, একটু অপেক্ষা করুন। 🙏"
 
-নিয়ম ৪ — পেমেন্ট তথ্য দেওয়ার নিয়ম:
-কাস্টমার পেমেন্ট কিভাবে করবে জানতে চাইলে, উপরের "পেমেন্ট তথ্য" থেকে সঠিক তথ্য দাও।
-- COD থাকলে বলো ক্যাশ অন ডেলিভারিতে পেমেন্ট করা যাবে
-- মোবাইল ব্যাংকিং থাকলে সঠিক নম্বর দাও (উপরে যা আছে ঠিক সেটাই)
-- অ্যাডভান্স পেমেন্ট লাগলে, কাস্টমারকে বলো কত টাকা অ্যাডভান্স দিতে হবে (মোট অর্ডারের উপর হিসাব করে)
-- অ্যাডভান্স অ্যামাউন্ট সবসময় পূর্ণ সংখ্যায় রাউন্ড আপ করো (কোনো ভগ্নাংশ বা দশমিক নয়)
-- কাস্টমার পেমেন্ট করার পরে ট্রানজেকশন আইডি (TrxID) চাও
+নিয়ম ৬ — দরাদরিতে বলো: "দাম ফিক্সড, দোকান মালিককে জিজ্ঞেস করে জানাচ্ছি!"
 
-নিয়ম ৫ — অভিযোগ হ্যান্ডেলিং:
-কাস্টমার যদি রাগান্বিত হয়, পণ্যে সমস্যা বলে, রিফান্ড চায়, বা কোনো অভিযোগ করে — তাহলে সমাধান করার চেষ্টা করবে না। শুধু বলো:
-"আপনার সমস্যার জন্য দুঃখিত। দোকান থেকে এখনই বিষয়টি দেখা হচ্ছে, অনুগ্রহ করে একটু অপেক্ষা করুন। 🙏"
+নিয়ম ৭ — কখনো "ভাই" বা "আপু" বলবে না। "আপনি" এবং কাস্টমারের নাম ব্যবহার করো। দোকান মালিককেও "আপু" বলবে না।
 
-নিয়ম ৬ — দাম নিয়ে দরাদরি করবে না:
-কাস্টমার দাম কমাতে চাইলে বলো:
-"দাম ফিক্সড, তবে দোকান মালিককে জিজ্ঞেস করে জানাচ্ছি! একটু অপেক্ষা করুন।"
-নিজে কোনো ছাড় দেবে না।
+নিয়ম ৮ — একই তথ্য বারবার দেবে না।
 
-নিয়ম ৭ — লিঙ্গ নিরপেক্ষতা:
-কাস্টমার ছেলে না মেয়ে জানো না। কখনো "ভাই" বা "আপু" বলে সম্বোধন করবে না। সবসময় শুধু "আপনি" ব্যবহার করো এবং কাস্টমারের নাম ব্যবহার করো। দোকান মালিককেও "আপু" বা "ভাই" বলবে না — "দোকান থেকে" বা "দোকান মালিক" বলো।
+নিয়ম ৯ — ছবি পাঠালে বলো: "ছবিটি পেয়েছি! প্রোডাক্টের নাম বলুন।"
 
-নিয়ম ৮ — পুনরাবৃত্তি নিষেধ:
-একই তথ্য বারবার দেবে না। কথোপকথনের ইতিহাস চেক করো — আগে যা বলা হয়েছে তা আবার বলবে না, যদি না কাস্টমার নিজে জিজ্ঞেস করে।
+নিয়ম ১০ — AI পরিচয় জিজ্ঞেস করলে বলো: "আমি দোকানের হয়ে সাহায্য করছি!"
 
-নিয়ম ৯ — ছবি মেসেজ:
-কাস্টমার ছবি পাঠালে তুমি দেখতে পাবে না। বলো:
-"ছবিটি পেয়েছি! প্রোডাক্টের নাম বা কালার বলুন, আমি এখনই দাম জানাতে পারি। অথবা দোকান থেকে শীঘ্রই দেখে জানানো হবে।"
+নিয়ম ১১ — ডেলিভারি না হলে বলো: "দুঃখিত, এই এলাকায় ডেলিভারি সেবা নেই।"
 
-নিয়ম ১০ — AI পরিচয়:
-নিজে থেকে বলবে না যে তুমি AI। কাস্টমার জিজ্ঞেস করলে বলো:
-"আমি দোকানের হয়ে আপনাকে সাহায্য করছি! প্রোডাক্ট, দাম, ডেলিভারি — যেকোনো প্রশ্নে আমি আছি। 😊"
+═══ টোন ═══
+- কাস্টমারের ভাষায় উত্তর দাও
+- সংক্ষিপ্ত: ২-৪ বাক্য
+- Markdown ব্যবহার করবে না
 
-নিয়ম ১১ — ডেলিভারি এলাকা যাচাই:
-কাস্টমারের ঠিকানা যে বিভাগে পড়ে, সেই বিভাগে ডেলিভারি চালু আছে কিনা উপরের "ডেলিভারি তথ্য" থেকে চেক করো। যদি সেই বিভাগে ডেলিভারি না হয়, বলো: "দুঃখিত, এই এলাকায় এই মুহূর্তে ডেলিভারি সেবা নেই।"
+═══ রেসপন্স ফরম্যাট (অবশ্যই মানতে হবে) ═══
 
-═══════════════════════════════════════════
-টোন ও ভাষা
-═══════════════════════════════════════════
-- কাস্টমার যে ভাষায় লেখে, সেই ভাষায় উত্তর দাও (বাংলা হলে বাংলায়, English হলে English এ)
-- Banglish (রোমান হরফে বাংলা) লিখলেও বাংলা হরফে উত্তর দাও
-- সহজ, উষ্ণ, বন্ধুত্বপূর্ণ ভাষা ব্যবহার করো
-- রিপ্লাই সংক্ষিপ্ত রাখো — সর্বোচ্চ ২-৪ বাক্য
-- 😊 ইমোজি শুধু উপযুক্ত সময়ে (সর্বোচ্চ ১-২ টি)। অভিযোগের সময় কখনো ইমোজি দেবে না
-- Markdown ফরম্যাটিং (**bold**, *italic*) ব্যবহার করবে না — Messenger এ এগুলো কাজ করে না
-
-═══════════════════════════════════════════
-রেসপন্স ফরম্যাট (অবশ্যই মানতে হবে)
-═══════════════════════════════════════════
-
-তোমার রেসপন্স অবশ্যই এই JSON ফরম্যাটে হতে হবে। অন্য কোনো টেক্সট দেবে না, শুধু JSON:
+তোমার রেসপন্স অবশ্যই এই JSON ফরম্যাটে হবে। শুধু JSON, অন্য কিছু নয়:
 
 {{
   "reply": "কাস্টমারকে পাঠানো মেসেজ",
@@ -419,23 +400,23 @@ async def classify_and_reply(
   "order_data": null
 }}
 
-যখন কাস্টমার অর্ডার কনফার্ম করে ("হ্যাঁ" বলে সারাংশ দেখার পরে), তখন order_submitted = true এবং order_data পূরণ করো:
+শুধুমাত্র যখন কাস্টমার সারাংশ দেখার পরে "হ্যাঁ" বলে তখনই order_submitted = true করো:
 
 {{
   "reply": "আপনার অর্ডারের তথ্য পেয়েছি! দোকান থেকে শীঘ্রই কনফার্ম করা হবে। ধন্যবাদ! 🙏",
   "order_submitted": true,
   "order_data": {{
-    "product_name": "প্রোডাক্টের নাম",
-    "amount": 1200,
-    "customer_name": "কাস্টমারের নাম",
-    "customer_phone": "01XXXXXXXXX",
-    "delivery_address": "পুরো ঠিকানা",
+    "product_name": "Pant",
+    "amount": 1700,
+    "customer_name": "Tasin",
+    "customer_phone": "01711328914",
+    "delivery_address": "35/2 ahamedbagh, basabo",
     "delivery_charge": 70
   }}
 }}
 
-মনে রাখো: amount হলো শুধু প্রোডাক্টের দাম (ডেলিভারি চার্জ ছাড়া)। delivery_charge আলাদা ফিল্ড।
-সবসময় শুধু JSON দাও। কোনো ব্যাখ্যা বা অতিরিক্ত টেক্সট দেবে না।"""
+amount = শুধু প্রোডাক্টের দাম। delivery_charge আলাদা। multiple items হলে amount = total product price (যেমন 3x Pant = 5100)।
+শুধু JSON দাও। কোনো ব্যাখ্যা দেবে না।"""
 
     messages = conversation_history + [{"role": "user", "content": comment_text}]
 
@@ -455,10 +436,10 @@ async def classify_and_reply(
     )
 
     raw_text = response.content[0].text.strip()
+    print(f"AI raw response: {raw_text[:300]}")
 
-    # Parse the JSON response
+    # Parse JSON response
     try:
-        # Handle cases where Claude wraps JSON in backticks
         cleaned = raw_text
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
@@ -472,9 +453,8 @@ async def classify_and_reply(
             "order_submitted": parsed.get("order_submitted", False),
             "order_data": parsed.get("order_data", None),
         }
-    except (json.JSONDecodeError, KeyError) as e:
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
         print(f"JSON parse error: {e}, raw: {raw_text[:200]}")
-        # Fallback: treat the whole response as plain text reply
         return {
             "reply_text": raw_text,
             "order_submitted": False,
@@ -482,13 +462,16 @@ async def classify_and_reply(
         }
 
 
+# ═══════════════════════════════════════════
+# MESSENGER / COMMENT REPLY
+# ═══════════════════════════════════════════
+
 async def post_comment_reply(comment_id: str, message: str):
     url = f"https://graph.facebook.com/v22.0/{comment_id}/comments"
     token = os.getenv("META_PAGE_ACCESS_TOKEN")
     async with httpx.AsyncClient() as http_client:
         resp = await http_client.post(url, params={
-            "message": message,
-            "access_token": token
+            "message": message, "access_token": token
         })
         print(f"Comment reply response: {resp.json()}")
         return resp.json()
@@ -507,6 +490,10 @@ async def send_messenger_reply(sender_id: str, message: str):
         print(f"Messenger reply response: {resp.json()}")
         return resp.json()
 
+
+# ═══════════════════════════════════════════
+# SELLER / CUSTOMER MANAGEMENT
+# ═══════════════════════════════════════════
 
 async def get_or_create_seller() -> str | None:
     try:
@@ -530,8 +517,7 @@ async def get_facebook_user_name(facebook_user_id: str) -> str:
         url = f"https://graph.facebook.com/v22.0/{facebook_user_id}"
         async with httpx.AsyncClient() as http_client:
             resp = await http_client.get(url, params={
-                "fields": "name",
-                "access_token": token
+                "fields": "name", "access_token": token
             })
             data = resp.json()
             return data.get("name", "Unknown")
@@ -541,7 +527,6 @@ async def get_facebook_user_name(facebook_user_id: str) -> str:
 
 
 async def get_or_create_customer(seller_id: str, facebook_user_id: str) -> dict:
-    """Returns full customer dict (not just id) so we can pass name to AI."""
     try:
         customer = supabase.table("customers").select("*").eq(
             "facebook_user_id", facebook_user_id).eq(
@@ -567,11 +552,10 @@ async def get_or_create_customer(seller_id: str, facebook_user_id: str) -> dict:
 
 
 async def save_messages_to_db(
-    seller_id: str,
-    customer_id: str,
-    incoming_text: str,
-    reply_text: str
+    seller_id: str, customer_id: str,
+    incoming_text: str, reply_text: str
 ):
+    """Save messages — only the reply text, NOT the raw JSON."""
     try:
         supabase.table("messages").insert({
             "seller_id": seller_id,
@@ -583,20 +567,20 @@ async def save_messages_to_db(
             "seller_id": seller_id,
             "customer_id": customer_id,
             "direction": "outgoing",
-            "content": reply_text
+            "content": reply_text  # This is the clean reply, not JSON
         }).execute()
     except Exception as e:
         print(f"Error saving messages: {e}")
 
 
+# ═══════════════════════════════════════════
+# MESSAGE HANDLER
+# ═══════════════════════════════════════════
+
 async def handle_message(
-    seller_id: str,
-    customer: dict,
-    comment_text: str,
-    reply_func,
-    reply_target: str,
+    seller_id: str, customer: dict,
+    comment_text: str, reply_func, reply_target: str,
 ):
-    """Unified message handler for both comments and Messenger."""
     customer_id = customer.get("id")
     customer_name = customer.get("name", "Unknown")
 
@@ -606,18 +590,24 @@ async def handle_message(
 
     reply_text = result["reply_text"]
 
-    # If AI submitted an order, save it to database
+    # Save order if AI submitted one
     if result["order_submitted"] and result["order_data"]:
         order_data = result["order_data"]
-        # Fill in customer name from our records if AI didn't extract it
         if not order_data.get("customer_name") or order_data["customer_name"] == "Unknown":
             order_data["customer_name"] = customer_name
-        await create_order_from_ai(seller_id, customer_id, order_data)
-        print(f"ORDER SAVED: {order_data.get('product_name')} for {order_data.get('customer_name')}")
+        success = await create_order_from_ai(seller_id, customer_id, order_data)
+        if success:
+            print(f"ORDER SAVED: {order_data.get('product_name')} for {order_data.get('customer_name')}")
+        else:
+            print(f"ORDER SAVE FAILED for {order_data.get('product_name')}")
 
     await reply_func(reply_target, reply_text)
     await save_messages_to_db(seller_id, customer_id, comment_text, reply_text)
 
+
+# ═══════════════════════════════════════════
+# WEBHOOK ENDPOINTS
+# ═══════════════════════════════════════════
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -633,7 +623,6 @@ async def receive_webhook(request: Request):
     print("Raw webhook body:", body)
 
     for entry in body.get("entry", []):
-        # Handle comment replies
         for change in entry.get("changes", []):
             if change.get("field") == "feed":
                 value = change.get("value", {})
@@ -651,23 +640,14 @@ async def receive_webhook(request: Request):
                             post_comment_reply, comment_id
                         )
 
-        # Handle Messenger messages
         for messaging in entry.get("messaging", []):
             message = messaging.get("message", {})
             sender_id = messaging.get("sender", {}).get("id", "")
-
-            # Check for image attachments
             attachments = message.get("attachments", [])
-            has_image = any(
-                a.get("type") == "image" for a in attachments
-            )
-
+            has_image = any(a.get("type") == "image" for a in attachments)
             comment_text = message.get("text", "")
-
-            # If image sent with no text, set a placeholder
             if has_image and not comment_text:
                 comment_text = "[কাস্টমার একটি ছবি পাঠিয়েছে]"
-
             if sender_id != PAGE_ID and comment_text:
                 seller_id = await get_or_create_seller()
                 if not seller_id:
@@ -679,6 +659,63 @@ async def receive_webhook(request: Request):
                 )
 
     return {"status": "ok"}
+
+
+# ═══════════════════════════════════════════
+# ORDER STATUS UPDATE ENDPOINT (called by dashboard)
+# ═══════════════════════════════════════════
+
+@app.post("/api/orders/{order_id}/status")
+async def update_order_status(order_id: str, request: Request):
+    """
+    Dashboard calls this when seller changes order status.
+    Automatically notifies the customer via Messenger.
+    """
+    try:
+        body = await request.json()
+        new_status = body.get("status")
+
+        if not new_status:
+            return {"error": "status is required"}
+
+        valid_statuses = ["new", "confirmed", "paid", "shipped", "delivered", "cancelled"]
+        if new_status not in valid_statuses:
+            return {"error": f"Invalid status. Must be one of: {valid_statuses}"}
+
+        # Get the order
+        order_res = supabase.table("orders").select("*").eq("id", order_id).single().execute()
+        if not order_res.data:
+            return {"error": "Order not found"}
+
+        order = order_res.data
+        old_status = order.get("status")
+
+        # Update the order status
+        supabase.table("orders").update({
+            "status": new_status
+        }).eq("id", order_id).execute()
+
+        # Notify customer via Messenger
+        customer_id = order.get("customer_id")
+        if customer_id:
+            # Get customer's facebook_user_id
+            cust_res = supabase.table("customers").select("facebook_user_id").eq(
+                "id", customer_id
+            ).single().execute()
+            if cust_res.data and cust_res.data.get("facebook_user_id"):
+                fb_id = cust_res.data["facebook_user_id"]
+                await notify_customer_status_change(fb_id, order, new_status)
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "old_status": old_status,
+            "new_status": new_status,
+            "customer_notified": True
+        }
+    except Exception as e:
+        print(f"Error updating order status: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/health")
