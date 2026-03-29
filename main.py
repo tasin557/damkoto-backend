@@ -97,6 +97,95 @@ async def get_customer_orders(seller_id: str, customer_id: str) -> str:
         return "অর্ডার তথ্য পাওয়া যাচ্ছে না।"
 
 
+async def get_delivery_settings(seller_id: str) -> str:
+    """Fetch division-level delivery settings for this seller."""
+    try:
+        result = supabase.table("delivery_settings").select("*").eq(
+            "seller_id", seller_id
+        ).eq("is_enabled", True).execute()
+
+        if not result.data:
+            return "ডেলিভারি সেটিংস এখনো কনফিগার করা হয়নি। কাস্টমার ডেলিভারি চার্জ জানতে চাইলে বলো: 'দোকান থেকে শীঘ্রই জানানো হবে।'"
+
+        division_names = {
+            "dhaka": "ঢাকা", "chittagong": "চট্টগ্রাম", "rajshahi": "রাজশাহী",
+            "khulna": "খুলনা", "barishal": "বরিশাল", "sylhet": "সিলেট",
+            "rangpur": "রংপুর", "mymensingh": "ময়মনসিংহ"
+        }
+
+        text = ""
+        for d in result.data:
+            div_name = division_names.get(d["division"], d["division"])
+            text += f"- {div_name}: ৳{d['delivery_charge']}, {d['estimated_days_min']}-{d['estimated_days_max']} দিন\n"
+
+        enabled_divisions = [d["division"] for d in result.data]
+        all_divisions = list(division_names.keys())
+        disabled = [division_names[d] for d in all_divisions if d not in enabled_divisions]
+        if disabled:
+            text += f"- ডেলিভারি হয় না: {', '.join(disabled)}\n"
+
+        return text
+    except Exception as e:
+        print(f"Error fetching delivery settings: {e}")
+        return "ডেলিভারি তথ্য পাওয়া যাচ্ছে না।"
+
+
+async def get_payment_settings(seller_id: str) -> str:
+    """Fetch payment method configuration for this seller."""
+    try:
+        result = supabase.table("payment_settings").select("*").eq(
+            "seller_id", seller_id
+        ).eq("is_enabled", True).execute()
+
+        if not result.data:
+            return "পেমেন্ট সেটিংস এখনো কনফিগার করা হয়নি। কাস্টমার পেমেন্ট জানতে চাইলে বলো: 'দোকান থেকে শীঘ্রই পেমেন্ট ডিটেইলস জানানো হবে।'"
+
+        type_names = {
+            "cod": "ক্যাশ অন ডেলিভারি (COD)",
+            "bkash": "bKash",
+            "nagad": "Nagad",
+            "rocket": "Rocket",
+        }
+
+        text = ""
+        for p in result.data:
+            name = type_names.get(p["payment_type"], p["payment_type"])
+            if p["payment_type"] == "cod":
+                text += f"- {name}: চালু আছে\n"
+            else:
+                text += f"- {name}: নম্বর {p.get('account_number', 'N/A')}"
+                if p.get("account_type"):
+                    text += f" ({p['account_type']})"
+                text += "\n"
+                if p.get("instructions"):
+                    text += f"  নির্দেশনা: {p['instructions']}\n"
+
+        return text
+    except Exception as e:
+        print(f"Error fetching payment settings: {e}")
+        return "পেমেন্ট তথ্য পাওয়া যাচ্ছে না।"
+
+
+async def get_shop_settings(seller_id: str) -> dict:
+    """Fetch shop-level settings (advance payment, free delivery, etc.)."""
+    defaults = {
+        "shop_name": None,
+        "advance_payment_type": "none",
+        "advance_percentage": 0,
+        "free_delivery_enabled": False,
+        "free_delivery_threshold": 0,
+    }
+    try:
+        result = supabase.table("shop_settings").select("*").eq(
+            "seller_id", seller_id
+        ).single().execute()
+        if result.data:
+            return result.data
+        return defaults
+    except Exception:
+        return defaults
+
+
 async def classify_and_reply(
     comment_text: str,
     seller_id: str,
@@ -106,8 +195,28 @@ async def classify_and_reply(
     catalog = await get_product_catalog(seller_id)
     conversation_history = await get_conversation_history(customer_id)
     customer_orders = await get_customer_orders(seller_id, customer_id)
+    delivery_info = await get_delivery_settings(seller_id)
+    payment_info = await get_payment_settings(seller_id)
+    shop = await get_shop_settings(seller_id)
 
-    system_prompt = f"""তুমি একটি বাংলাদেশি F-commerce দোকানের কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট। তোমার কাজ হলো কাস্টমারদের সাথে বাংলায় সহজ ও বন্ধুত্বপূর্ণভাবে কথা বলা। তুমি দোকান মালিকের হয়ে কাজ করো।
+    # Build advance payment instruction
+    advance_text = ""
+    if shop.get("advance_payment_type") == "full":
+        advance_text = "অর্ডার কনফার্ম হলে পুরো টাকা আগে পেমেন্ট করতে হবে।"
+    elif shop.get("advance_payment_type") == "partial":
+        pct = shop.get("advance_percentage", 0)
+        advance_text = f"অর্ডার কনফার্ম হলে মোট মূল্যের {pct}% অ্যাডভান্স পেমেন্ট করতে হবে। বাকি টাকা ডেলিভারির সময় দিতে হবে। অ্যাডভান্স হিসাব করার সময় ভগ্নাংশ বা দশমিক সংখ্যা দেবে না — পূর্ণ সংখ্যায় রাউন্ড আপ করো। যেমন: ৳৫০০ এর {pct}% = ৳{round(500 * pct / 100)} অ্যাডভান্স।"
+    else:
+        advance_text = "কোনো অ্যাডভান্স পেমেন্ট লাগবে না। ক্যাশ অন ডেলিভারি (COD) বা পেমেন্ট মেথডের মাধ্যমে পেমেন্ট করা যাবে।"
+
+    # Free delivery info
+    free_delivery_text = ""
+    if shop.get("free_delivery_enabled") and shop.get("free_delivery_threshold", 0) > 0:
+        free_delivery_text = f"৳{shop['free_delivery_threshold']} বা তার বেশি অর্ডারে ডেলিভারি ফ্রি।"
+
+    shop_name = shop.get("shop_name") or "দোকান"
+
+    system_prompt = f"""তুমি "{shop_name}" এর কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট — একটি বাংলাদেশি F-commerce দোকান। তোমার কাজ হলো কাস্টমারদের সাথে বাংলায় সহজ ও বন্ধুত্বপূর্ণভাবে কথা বলা। তুমি দোকান মালিকের হয়ে কাজ করো।
 
 ═══════════════════════════════════════════
 কাস্টমারের তথ্য (ডেটাবেস থেকে — এটাই সত্য)
@@ -122,6 +231,21 @@ async def classify_and_reply(
 প্রোডাক্ট ক্যাটালগ
 ═══════════════════════════════════════════
 {catalog}
+
+═══════════════════════════════════════════
+ডেলিভারি তথ্য
+═══════════════════════════════════════════
+{delivery_info}
+{free_delivery_text}
+
+═══════════════════════════════════════════
+পেমেন্ট তথ্য
+═══════════════════════════════════════════
+{payment_info}
+{advance_text}
+
+সতর্কতা — পেমেন্ট নম্বর:
+উপরে যে মোবাইল ব্যাংকিং নম্বর দেওয়া আছে, সেটাই কাস্টমারকে দাও। কখনো নিজে থেকে নম্বর বানিয়ে দেবে না। ভুল নম্বর দিলে কাস্টমারের টাকা অন্য কারো কাছে চলে যাবে। যদি নম্বর "N/A" বা খালি থাকে, তাহলে বলো: "দোকান থেকে পেমেন্ট ডিটেইলস জানানো হবে।"
 
 ═══════════════════════════════════════════
 কঠোর নিয়মাবলী — এগুলো কখনো ভাঙবে না
@@ -146,41 +270,54 @@ async def classify_and_reply(
   ৩) ফোন নম্বর
   ৪) ডেলিভারি ঠিকানা (এলাকা, রোড, বাসা নম্বর)
 কোনো তথ্য বাদ দেবে না। সব তথ্য পাওয়ার আগে "অর্ডার পেয়েছি" বলবে না।
-সব তথ্য পেলে, সারাংশ দেখাও:
+সব তথ্য পেলে, ডেলিভারি চার্জ হিসাব করো (ঠিকানা থেকে বিভাগ বুঝে উপরের ডেলিভারি তথ্য থেকে চার্জ নাও)।
+তারপর সারাংশ দেখাও:
 "আপনার অর্ডারের তথ্য:
 📦 প্রোডাক্ট: [নাম] — ৳[দাম]
 👤 নাম: [নাম]
 📱 ফোন: [নম্বর]
 📍 ঠিকানা: [ঠিকানা]
-🚚 ডেলিভারি: ঢাকার ভেতরে ২-৩ দিন / ঢাকার বাইরে ৩-৫ দিন
+🚚 ডেলিভারি: ৳[চার্জ] ([বিভাগ], [দিন])
+💰 মোট: ৳[দাম + ডেলিভারি চার্জ]
 
 সব ঠিক আছে? 'হ্যাঁ' বলুন।"
 
 কাস্টমার "হ্যাঁ" বললে বলো:
 "আপনার অর্ডারের তথ্য পেয়েছি! দোকান থেকে শীঘ্রই কনফার্ম করা হবে এবং পেমেন্টের ডিটেইলস জানানো হবে। ধন্যবাদ! 🙏"
 
-নিয়ম ৪ — অভিযোগ হ্যান্ডেলিং:
+নিয়ম ৪ — পেমেন্ট তথ্য দেওয়ার নিয়ম:
+কাস্টমার পেমেন্ট কিভাবে করবে জানতে চাইলে, উপরের "পেমেন্ট তথ্য" থেকে সঠিক তথ্য দাও।
+- COD থাকলে বলো ক্যাশ অন ডেলিভারিতে পেমেন্ট করা যাবে
+- মোবাইল ব্যাংকিং থাকলে সঠিক নম্বর দাও (উপরে যা আছে ঠিক সেটাই)
+- অ্যাডভান্স পেমেন্ট লাগলে, কাস্টমারকে বলো কত টাকা অ্যাডভান্স দিতে হবে (মোট অর্ডারের উপর হিসাব করে)
+- অ্যাডভান্স অ্যামাউন্ট সবসময় পূর্ণ সংখ্যায় রাউন্ড আপ করো (কোনো ভগ্নাংশ বা দশমিক নয়)
+- কাস্টমার পেমেন্ট করার পরে ট্রানজেকশন আইডি (TrxID) চাও
+
+নিয়ম ৫ — অভিযোগ হ্যান্ডেলিং:
 কাস্টমার যদি রাগান্বিত হয়, পণ্যে সমস্যা বলে, রিফান্ড চায়, বা কোনো অভিযোগ করে — তাহলে সমাধান করার চেষ্টা করবে না। শুধু বলো:
 "আপনার সমস্যার জন্য দুঃখিত। দোকান থেকে এখনই বিষয়টি দেখা হচ্ছে, অনুগ্রহ করে একটু অপেক্ষা করুন। 🙏"
 
-নিয়ম ৫ — দাম নিয়ে দরাদরি করবে না:
+নিয়ম ৬ — দাম নিয়ে দরাদরি করবে না:
 কাস্টমার দাম কমাতে চাইলে বলো:
 "দাম ফিক্সড, তবে দোকান মালিককে জিজ্ঞেস করে জানাচ্ছি! একটু অপেক্ষা করুন।"
 নিজে কোনো ছাড় দেবে না।
 
-নিয়ম ৬ — লিঙ্গ নিরপেক্ষতা:
+নিয়ম ৭ — লিঙ্গ নিরপেক্ষতা:
 কাস্টমার ছেলে না মেয়ে জানো না। কখনো "ভাই" বা "আপু" বলে সম্বোধন করবে না। সবসময় শুধু "আপনি" ব্যবহার করো এবং কাস্টমারের নাম ব্যবহার করো। দোকান মালিককেও "আপু" বা "ভাই" বলবে না — "দোকান থেকে" বা "দোকান মালিক" বলো।
 
-নিয়ম ৭ — পুনরাবৃত্তি নিষেধ:
+নিয়ম ৮ — পুনরাবৃত্তি নিষেধ:
 একই তথ্য বারবার দেবে না। কথোপকথনের ইতিহাস চেক করো — আগে যা বলা হয়েছে তা আবার বলবে না, যদি না কাস্টমার নিজে জিজ্ঞেস করে।
 
-নিয়ম ৮ — ছবি মেসেজ:
+নিয়ম ৯ — ছবি মেসেজ:
 কাস্টমার ছবি পাঠালে তুমি দেখতে পাবে না। বলো:
 "ছবিটি পেয়েছি! প্রোডাক্টের নাম বা কালার বলুন, আমি এখনই দাম জানাতে পারি। অথবা দোকান থেকে শীঘ্রই দেখে জানানো হবে।"
 
-নিয়ম ৯ — AI পরিচয়:
+নিয়ম ১০ — AI পরিচয়:
 নিজে থেকে বলবে না যে তুমি AI। কাস্টমার জিজ্ঞেস করলে বলো:
 "আমি দোকানের হয়ে আপনাকে সাহায্য করছি! প্রোডাক্ট, দাম, ডেলিভারি — যেকোনো প্রশ্নে আমি আছি। 😊"
+
+নিয়ম ১১ — ডেলিভারি এলাকা যাচাই:
+কাস্টমারের ঠিকানা যে বিভাগে পড়ে, সেই বিভাগে ডেলিভারি চালু আছে কিনা উপরের "ডেলিভারি তথ্য" থেকে চেক করো। যদি সেই বিভাগে ডেলিভারি না হয়, বলো: "দুঃখিত, এই এলাকায় এই মুহূর্তে ডেলিভারি সেবা নেই।"
 
 ═══════════════════════════════════════════
 টোন ও ভাষা
@@ -191,12 +328,6 @@ async def classify_and_reply(
 - রিপ্লাই সংক্ষিপ্ত রাখো — সর্বোচ্চ ২-৪ বাক্য
 - 😊 ইমোজি শুধু উপযুক্ত সময়ে (সর্বোচ্চ ১-২ টি)। অভিযোগের সময় কখনো ইমোজি দেবে না
 - Markdown ফরম্যাটিং (**bold**, *italic*) ব্যবহার করবে না — Messenger এ এগুলো কাজ করে না
-
-═══════════════════════════════════════════
-ডেলিভারি তথ্য
-═══════════════════════════════════════════
-- ঢাকার ভেতরে: ২-৩ দিন
-- ঢাকার বাইরে: ৩-৫ দিন
 
 শুধুমাত্র বাংলায় উত্তর দাও (যদি না কাস্টমার English এ লেখে)।"""
 
