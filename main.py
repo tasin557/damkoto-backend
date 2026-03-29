@@ -3,8 +3,9 @@ from fastapi import FastAPI, Request
 from anthropic import Anthropic
 from dotenv import load_dotenv
 import httpx
-import os
 import json
+import math
+import os
 
 load_dotenv()
 
@@ -36,6 +37,27 @@ async def get_product_catalog(seller_id: str) -> str:
     except Exception as e:
         print(f"Error fetching products: {e}")
         return "প্রোডাক্ট তথ্য পাওয়া যাচ্ছে না।"
+
+
+async def get_product_price(seller_id: str, product_name: str) -> float:
+    """Look up a product's price by name (fuzzy match)."""
+    try:
+        products = supabase.table("products").select("name, price").eq(
+            "seller_id", seller_id).eq("in_stock", True).execute()
+        if not products.data:
+            return 0
+        # Try exact match first
+        for p in products.data:
+            if p["name"].lower().strip() == product_name.lower().strip():
+                return float(p["price"])
+        # Try partial match
+        for p in products.data:
+            if product_name.lower().strip() in p["name"].lower().strip() or \
+               p["name"].lower().strip() in product_name.lower().strip():
+                return float(p["price"])
+        return 0
+    except Exception:
+        return 0
 
 
 async def get_conversation_history(customer_id: str) -> list:
@@ -145,6 +167,7 @@ async def get_payment_settings(seller_id: str) -> str:
             "bkash": "bKash",
             "nagad": "Nagad",
             "rocket": "Rocket",
+            "bank_transfer": "ব্যাংক ট্রান্সফার"
         }
 
         text = ""
@@ -186,12 +209,66 @@ async def get_shop_settings(seller_id: str) -> dict:
         return defaults
 
 
+async def create_order_from_ai(
+    seller_id: str,
+    customer_id: str,
+    order_data: dict
+) -> bool:
+    """Create an order in the database from AI-extracted data."""
+    try:
+        product_name = order_data.get("product_name", "")
+        customer_name = order_data.get("customer_name", "")
+        customer_phone = order_data.get("customer_phone", "")
+        delivery_address = order_data.get("delivery_address", "")
+        amount = order_data.get("amount", 0)
+        delivery_charge = order_data.get("delivery_charge", 0)
+
+        # Try to find actual product price if amount is 0
+        if not amount and product_name:
+            amount = await get_product_price(seller_id, product_name)
+
+        total = float(amount) + float(delivery_charge)
+
+        # Build notes with all customer details
+        notes_parts = []
+        if customer_phone:
+            notes_parts.append(f"ফোন: {customer_phone}")
+        if delivery_address:
+            notes_parts.append(f"ঠিকানা: {delivery_address}")
+        if delivery_charge:
+            notes_parts.append(f"ডেলিভারি: ৳{delivery_charge}")
+        notes = " | ".join(notes_parts)
+
+        supabase.table("orders").insert({
+            "seller_id": seller_id,
+            "customer_id": customer_id,
+            "customer_name": customer_name or "Unknown",
+            "product_name": product_name or "Unknown",
+            "amount": total,
+            "status": "new",
+            "notes": notes,
+        }).execute()
+
+        # Also update customer phone if we got it
+        if customer_phone and customer_id:
+            supabase.table("customers").update({
+                "phone": customer_phone
+            }).eq("id", customer_id).execute()
+
+        print(f"Order created: {product_name} for {customer_name} - ৳{total}")
+        return True
+    except Exception as e:
+        print(f"Error creating order: {e}")
+        return False
+
+
 async def classify_and_reply(
     comment_text: str,
     seller_id: str,
     customer_id: str = None,
     customer_name: str = "Unknown"
-) -> str:
+) -> dict:
+    """Returns dict with 'reply_text' and optional 'order_data'."""
     catalog = await get_product_catalog(seller_id)
     conversation_history = await get_conversation_history(customer_id)
     customer_orders = await get_customer_orders(seller_id, customer_id)
@@ -205,7 +282,7 @@ async def classify_and_reply(
         advance_text = "অর্ডার কনফার্ম হলে পুরো টাকা আগে পেমেন্ট করতে হবে।"
     elif shop.get("advance_payment_type") == "partial":
         pct = shop.get("advance_percentage", 0)
-        advance_text = f"অর্ডার কনফার্ম হলে মোট মূল্যের {pct}% অ্যাডভান্স পেমেন্ট করতে হবে। বাকি টাকা ডেলিভারির সময় দিতে হবে। অ্যাডভান্স হিসাব করার সময় ভগ্নাংশ বা দশমিক সংখ্যা দেবে না — পূর্ণ সংখ্যায় রাউন্ড আপ করো। যেমন: ৳৫০০ এর {pct}% = ৳{round(500 * pct / 100)} অ্যাডভান্স।"
+        advance_text = f"অর্ডার কনফার্ম হলে মোট মূল্যের {pct}% অ্যাডভান্স পেমেন্ট করতে হবে। বাকি টাকা ডেলিভারির সময় দিতে হবে। অ্যাডভান্স হিসাব করার সময় ভগ্নাংশ বা দশমিক সংখ্যা দেবে না — পূর্ণ সংখ্যায় রাউন্ড আপ করো।"
     else:
         advance_text = "কোনো অ্যাডভান্স পেমেন্ট লাগবে না। ক্যাশ অন ডেলিভারি (COD) বা পেমেন্ট মেথডের মাধ্যমে পেমেন্ট করা যাবে।"
 
@@ -262,6 +339,7 @@ async def classify_and_reply(
 - কাস্টমার "আমি অর্ডার দিয়েছি" বলে তাকে বলো: "হ্যাঁ, আপনার অর্ডার প্রসেসে আছে! দোকান থেকে শীঘ্রই কনফার্ম করা হবে।"
 - কাস্টমার ডেলিভারি চার্জ বা অন্য প্রশ্ন করলে, তার অর্ডার রেফারেন্স করে উত্তর দাও
 - কখনো বলবে না "কোন পণ্য নিতে চান?" বা "What would you like to order?" যদি সে ইতিমধ্যে অর্ডার দিয়ে থাকে
+- কিন্তু কাস্টমার যদি নতুন আরেকটি প্রোডাক্ট অর্ডার করতে চায়, সেটা অনুমতি দাও।
 
 নিয়ম ৩ — অর্ডারের জন্য সব তথ্য সংগ্রহ করো:
 কাস্টমার অর্ডার করতে চাইলে, এই ৪টি তথ্য অবশ্যই সংগ্রহ করতে হবে:
@@ -329,7 +407,35 @@ async def classify_and_reply(
 - 😊 ইমোজি শুধু উপযুক্ত সময়ে (সর্বোচ্চ ১-২ টি)। অভিযোগের সময় কখনো ইমোজি দেবে না
 - Markdown ফরম্যাটিং (**bold**, *italic*) ব্যবহার করবে না — Messenger এ এগুলো কাজ করে না
 
-শুধুমাত্র বাংলায় উত্তর দাও (যদি না কাস্টমার English এ লেখে)।"""
+═══════════════════════════════════════════
+রেসপন্স ফরম্যাট (অবশ্যই মানতে হবে)
+═══════════════════════════════════════════
+
+তোমার রেসপন্স অবশ্যই এই JSON ফরম্যাটে হতে হবে। অন্য কোনো টেক্সট দেবে না, শুধু JSON:
+
+{{
+  "reply": "কাস্টমারকে পাঠানো মেসেজ",
+  "order_submitted": false,
+  "order_data": null
+}}
+
+যখন কাস্টমার অর্ডার কনফার্ম করে ("হ্যাঁ" বলে সারাংশ দেখার পরে), তখন order_submitted = true এবং order_data পূরণ করো:
+
+{{
+  "reply": "আপনার অর্ডারের তথ্য পেয়েছি! দোকান থেকে শীঘ্রই কনফার্ম করা হবে। ধন্যবাদ! 🙏",
+  "order_submitted": true,
+  "order_data": {{
+    "product_name": "প্রোডাক্টের নাম",
+    "amount": 1200,
+    "customer_name": "কাস্টমারের নাম",
+    "customer_phone": "01XXXXXXXXX",
+    "delivery_address": "পুরো ঠিকানা",
+    "delivery_charge": 70
+  }}
+}}
+
+মনে রাখো: amount হলো শুধু প্রোডাক্টের দাম (ডেলিভারি চার্জ ছাড়া)। delivery_charge আলাদা ফিল্ড।
+সবসময় শুধু JSON দাও। কোনো ব্যাখ্যা বা অতিরিক্ত টেক্সট দেবে না।"""
 
     messages = conversation_history + [{"role": "user", "content": comment_text}]
 
@@ -343,11 +449,37 @@ async def classify_and_reply(
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=400,
+        max_tokens=500,
         system=system_prompt,
         messages=fixed_messages
     )
-    return response.content[0].text
+
+    raw_text = response.content[0].text.strip()
+
+    # Parse the JSON response
+    try:
+        # Handle cases where Claude wraps JSON in backticks
+        cleaned = raw_text
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        parsed = json.loads(cleaned)
+        return {
+            "reply_text": parsed.get("reply", raw_text),
+            "order_submitted": parsed.get("order_submitted", False),
+            "order_data": parsed.get("order_data", None),
+        }
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"JSON parse error: {e}, raw: {raw_text[:200]}")
+        # Fallback: treat the whole response as plain text reply
+        return {
+            "reply_text": raw_text,
+            "order_submitted": False,
+            "order_data": None,
+        }
 
 
 async def post_comment_reply(comment_id: str, message: str):
@@ -457,6 +589,36 @@ async def save_messages_to_db(
         print(f"Error saving messages: {e}")
 
 
+async def handle_message(
+    seller_id: str,
+    customer: dict,
+    comment_text: str,
+    reply_func,
+    reply_target: str,
+):
+    """Unified message handler for both comments and Messenger."""
+    customer_id = customer.get("id")
+    customer_name = customer.get("name", "Unknown")
+
+    result = await classify_and_reply(
+        comment_text, seller_id, customer_id, customer_name
+    )
+
+    reply_text = result["reply_text"]
+
+    # If AI submitted an order, save it to database
+    if result["order_submitted"] and result["order_data"]:
+        order_data = result["order_data"]
+        # Fill in customer name from our records if AI didn't extract it
+        if not order_data.get("customer_name") or order_data["customer_name"] == "Unknown":
+            order_data["customer_name"] = customer_name
+        await create_order_from_ai(seller_id, customer_id, order_data)
+        print(f"ORDER SAVED: {order_data.get('product_name')} for {order_data.get('customer_name')}")
+
+    await reply_func(reply_target, reply_text)
+    await save_messages_to_db(seller_id, customer_id, comment_text, reply_text)
+
+
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
@@ -484,14 +646,9 @@ async def receive_webhook(request: Request):
                         if not seller_id:
                             continue
                         customer = await get_or_create_customer(seller_id, sender_id)
-                        customer_id = customer.get("id")
-                        customer_name = customer.get("name", "Unknown")
-                        reply = await classify_and_reply(
-                            comment_text, seller_id, customer_id, customer_name
-                        )
-                        await post_comment_reply(comment_id, reply)
-                        await save_messages_to_db(
-                            seller_id, customer_id, comment_text, reply
+                        await handle_message(
+                            seller_id, customer, comment_text,
+                            post_comment_reply, comment_id
                         )
 
         # Handle Messenger messages
@@ -516,14 +673,9 @@ async def receive_webhook(request: Request):
                 if not seller_id:
                     continue
                 customer = await get_or_create_customer(seller_id, sender_id)
-                customer_id = customer.get("id")
-                customer_name = customer.get("name", "Unknown")
-                reply = await classify_and_reply(
-                    comment_text, seller_id, customer_id, customer_name
-                )
-                await send_messenger_reply(sender_id, reply)
-                await save_messages_to_db(
-                    seller_id, customer_id, comment_text, reply
+                await handle_message(
+                    seller_id, customer, comment_text,
+                    send_messenger_reply, sender_id
                 )
 
     return {"status": "ok"}
