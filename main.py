@@ -271,19 +271,66 @@ async def create_order_from_ai(
 # ═══════════════════════════════════════════
 
 async def notify_customer_status_change(
-    customer_facebook_id: str, order: dict, new_status: str
+    customer_facebook_id: str, order: dict, new_status: str,
+    seller_id: str = None
 ):
-    """Send a Messenger notification to customer when order status changes."""
-    status_messages = {
-        "confirmed": f"আপনার অর্ডার ({order.get('product_name', '')}) কনফার্ম হয়েছে! 🎉 শীঘ্রই পেমেন্ট ও ডেলিভারির তথ্য জানানো হবে।",
-        "paid": f"আপনার অর্ডারের ({order.get('product_name', '')}) পেমেন্ট রিসিভ হয়েছে। ধন্যবাদ! ✅",
-        "shipped": f"আপনার অর্ডার ({order.get('product_name', '')}) শিপ করা হয়েছে! 🚚 শীঘ্রই পেয়ে যাবেন।",
-        "delivered": f"আপনার অর্ডার ({order.get('product_name', '')}) ডেলিভার হয়েছে! 📦 ধন্যবাদ আমাদের সাথে কেনাকাটার জন্য! 🙏",
-        "cancelled": f"দুঃখিত, আপনার অর্ডার ({order.get('product_name', '')}) ক্যান্সেল করা হয়েছে। কোনো প্রশ্ন থাকলে জানান। 🙏",
-    }
+    """Send Messenger notification on confirmed and shipped status changes."""
+    product = order.get('product_name', 'আপনার অর্ডার')
+    amount = order.get('amount', 0)
+    notes = order.get('notes', '')
 
-    message = status_messages.get(new_status)
-    if not message:
+    if new_status == "confirmed":
+        # Build payment info for the confirmation message
+        payment_text = ""
+        if seller_id:
+            try:
+                pay_res = supabase.table("payment_settings").select("*").eq(
+                    "seller_id", seller_id
+                ).eq("is_enabled", True).execute()
+                if pay_res.data:
+                    for p in pay_res.data:
+                        if p["payment_type"] == "cod":
+                            payment_text += "ক্যাশ অন ডেলিভারি (COD) তে পেমেন্ট করতে পারবেন।\n"
+                        elif p["payment_type"] == "bkash" and p.get("account_number"):
+                            payment_text += f"bKash: {p['account_number']} ({p.get('account_type', 'personal')}) এ Send Money করুন।\n"
+                        elif p["payment_type"] == "nagad" and p.get("account_number"):
+                            payment_text += f"Nagad: {p['account_number']} এ পেমেন্ট করুন।\n"
+                        elif p["payment_type"] == "rocket" and p.get("account_number"):
+                            payment_text += f"Rocket: {p['account_number']} এ পেমেন্ট করুন।\n"
+
+                # Check advance payment
+                shop_res = supabase.table("shop_settings").select("*").eq(
+                    "seller_id", seller_id
+                ).single().execute()
+                if shop_res.data:
+                    adv_type = shop_res.data.get("advance_payment_type", "none")
+                    if adv_type == "full":
+                        payment_text += f"\nপুরো ৳{amount} আগে পেমেন্ট করতে হবে।"
+                    elif adv_type == "partial":
+                        pct = shop_res.data.get("advance_percentage", 0)
+                        adv_amount = math.ceil(float(amount) * pct / 100)
+                        payment_text += f"\n৳{adv_amount} অ্যাডভান্স পেমেন্ট করুন ({pct}%)। বাকি ডেলিভারির সময়।"
+            except Exception as e:
+                print(f"Error fetching payment info for notification: {e}")
+
+        message = f"আপনার অর্ডার কনফার্ম হয়েছে! 🎉\n\n"
+        message += f"📦 {product}\n💰 মোট: ৳{amount}\n\n"
+        if payment_text:
+            message += f"পেমেন্ট:\n{payment_text}\n\n"
+            message += "পেমেন্ট করার পর TrxID পাঠান।"
+        else:
+            message += "পেমেন্টের ডিটেইলস শীঘ্রই জানানো হবে।"
+
+    elif new_status == "shipped":
+        message = f"আপনার অর্ডার ({product}) শিপ করা হয়েছে! 🚚\n"
+        message += f"মোট: ৳{amount}\n"
+        message += "শীঘ্রই পেয়ে যাবেন!"
+
+    elif new_status == "cancelled":
+        message = f"দুঃখিত, আপনার অর্ডার ({product}) ক্যান্সেল করা হয়েছে। কোনো প্রশ্ন থাকলে জানান। 🙏"
+
+    else:
+        # Don't send notifications for other status changes
         return
 
     try:
@@ -385,6 +432,20 @@ async def classify_and_reply(
 
 নিয়ম ১১ — ডেলিভারি না হলে বলো: "দুঃখিত, এই এলাকায় ডেলিভারি সেবা নেই।"
 
+নিয়ম ১২ — দোকান মালিকের কাছে হস্তান্তর:
+নিচের যেকোনো পরিস্থিতিতে needs_seller = true করো এবং কাস্টমারকে বলো "দোকান মালিক শীঘ্রই যোগাযোগ করবে":
+- অর্ডার ক্যান্সেল করতে চায়
+- অর্ডার এডিট/পরিবর্তন করতে চায় (প্রোডাক্ট, সংখ্যা, ঠিকানা)
+- রিটার্ন বা রিফান্ড চায়
+- পণ্যে সমস্যা বা অভিযোগ
+- সরাসরি দোকান মালিকের সাথে কথা বলতে চায় ("I want to talk to the owner", "মালিকের সাথে কথা বলতে চাই")
+- এমন প্রশ্ন যার উত্তর তোমার কাছে নেই
+- কাস্টমার হতাশ বা বিরক্ত হচ্ছে
+- কাস্টম অর্ডার বা বিশেষ অনুরোধ
+- দরাদরি করছে
+
+বলো: "আপনার অনুরোধ পেয়েছি। দোকান মালিক শীঘ্রই আপনার সাথে যোগাযোগ করবে। একটু অপেক্ষা করুন। 🙏"
+
 ═══ টোন ═══
 - কাস্টমারের ভাষায় উত্তর দাও
 - সংক্ষিপ্ত: ২-৪ বাক্য
@@ -397,25 +458,32 @@ async def classify_and_reply(
 {{
   "reply": "কাস্টমারকে পাঠানো মেসেজ",
   "order_submitted": false,
-  "order_data": null
+  "order_data": null,
+  "needs_seller": false
 }}
 
-শুধুমাত্র যখন কাস্টমার সারাংশ দেখার পরে "হ্যাঁ" বলে তখনই order_submitted = true করো:
+শুধুমাত্র যখন কাস্টমার সারাংশ দেখার পরে "হ্যাঁ"/"yes"/"ok" বলে তখনই order_submitted = true করো:
 
 {{
   "reply": "আপনার অর্ডারের তথ্য পেয়েছি! দোকান থেকে শীঘ্রই কনফার্ম করা হবে। ধন্যবাদ! 🙏",
   "order_submitted": true,
   "order_data": {{
-    "product_name": "Pant",
-    "amount": 1700,
+    "product_name": "3x Pant, 1x Pink Shirt",
+    "amount": 6800,
     "customer_name": "Tasin",
     "customer_phone": "01711328914",
     "delivery_address": "35/2 ahamedbagh, basabo",
     "delivery_charge": 70
-  }}
+  }},
+  "needs_seller": false
 }}
 
-amount = শুধু প্রোডাক্টের দাম। delivery_charge আলাদা। multiple items হলে amount = total product price (যেমন 3x Pant = 5100)।
+product_name: সব আইটেম ও সংখ্যা লেখো। যেমন: "3x Pant" বা "Baggy Pants, Pink Shirt, লাল কটন শাড়ি"।
+amount: সব প্রোডাক্টের মোট দাম (ডেলিভারি ছাড়া)।
+delivery_charge: আলাদা ফিল্ড।
+
+needs_seller = true: যখন কাস্টমারের অনুরোধ দোকান মালিকের দরকার।
+
 শুধু JSON দাও। কোনো ব্যাখ্যা দেবে না।"""
 
     messages = conversation_history + [{"role": "user", "content": comment_text}]
@@ -452,6 +520,7 @@ amount = শুধু প্রোডাক্টের দাম। delivery_ch
             "reply_text": parsed.get("reply", raw_text),
             "order_submitted": parsed.get("order_submitted", False),
             "order_data": parsed.get("order_data", None),
+            "needs_seller": parsed.get("needs_seller", False),
         }
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         print(f"JSON parse error: {e}, raw: {raw_text[:200]}")
@@ -459,6 +528,7 @@ amount = শুধু প্রোডাক্টের দাম। delivery_ch
             "reply_text": raw_text,
             "order_submitted": False,
             "order_data": None,
+            "needs_seller": False,
         }
 
 
@@ -601,6 +671,20 @@ async def handle_message(
         else:
             print(f"ORDER SAVE FAILED for {order_data.get('product_name')}")
 
+    # Flag for seller attention if needed
+    if result.get("needs_seller"):
+        print(f"SELLER ATTENTION NEEDED: customer={customer_name}, msg={comment_text[:100]}")
+        # Save a flag message so seller can see it in the dashboard
+        try:
+            supabase.table("messages").insert({
+                "seller_id": seller_id,
+                "customer_id": customer_id,
+                "direction": "system",
+                "content": f"⚠️ দোকান মালিকের মনোযোগ দরকার: {comment_text[:200]}"
+            }).execute()
+        except Exception as e:
+            print(f"Error saving seller flag: {e}")
+
     await reply_func(reply_target, reply_text)
     await save_messages_to_db(seller_id, customer_id, comment_text, reply_text)
 
@@ -704,7 +788,10 @@ async def update_order_status(order_id: str, request: Request):
             ).single().execute()
             if cust_res.data and cust_res.data.get("facebook_user_id"):
                 fb_id = cust_res.data["facebook_user_id"]
-                await notify_customer_status_change(fb_id, order, new_status)
+                await notify_customer_status_change(
+                    fb_id, order, new_status,
+                    seller_id=order.get("seller_id")
+                )
 
         return {
             "success": True,
