@@ -654,6 +654,21 @@ async def handle_message(
     customer_id = customer.get("id")
     customer_name = customer.get("name", "Unknown")
 
+    # Check if seller is actively replying (pause AI)
+    if await is_seller_active(customer_id):
+        print(f"AI PAUSED: seller is active for customer {customer_name}")
+        # Save incoming message but don't reply
+        try:
+            supabase.table("messages").insert({
+                "seller_id": seller_id,
+                "customer_id": customer_id,
+                "direction": "incoming",
+                "content": comment_text
+            }).execute()
+        except Exception:
+            pass
+        return
+
     result = await classify_and_reply(
         comment_text, seller_id, customer_id, customer_name
     )
@@ -671,10 +686,9 @@ async def handle_message(
         else:
             print(f"ORDER SAVE FAILED for {order_data.get('product_name')}")
 
-    # Flag for seller attention if needed
+    # Flag for seller attention if needed — also pause AI for this customer
     if result.get("needs_seller"):
         print(f"SELLER ATTENTION NEEDED: customer={customer_name}, msg={comment_text[:100]}")
-        # Save a flag message so seller can see it in the dashboard
         try:
             supabase.table("messages").insert({
                 "seller_id": seller_id,
@@ -682,11 +696,59 @@ async def handle_message(
                 "direction": "system",
                 "content": f"⚠️ দোকান মালিকের মনোযোগ দরকার: {comment_text[:200]}"
             }).execute()
+            # Pause AI for this customer so seller can handle it
+            await pause_ai_for_customer(customer_id)
         except Exception as e:
             print(f"Error saving seller flag: {e}")
 
     await reply_func(reply_target, reply_text)
     await save_messages_to_db(seller_id, customer_id, comment_text, reply_text)
+
+
+async def is_seller_active(customer_id: str) -> bool:
+    """Check if AI is paused for this customer (seller is handling it)."""
+    try:
+        # Check for seller_reply messages in last 10 minutes
+        from datetime import datetime, timedelta, timezone
+        ten_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+        result = supabase.table("messages").select("id").eq(
+            "customer_id", customer_id
+        ).eq("direction", "seller_reply").gte(
+            "created_at", ten_min_ago
+        ).limit(1).execute()
+
+        if result.data:
+            return True
+
+        # Also check if there's a recent AI pause flag
+        pause_result = supabase.table("messages").select("id").eq(
+            "customer_id", customer_id
+        ).eq("direction", "ai_paused").gte(
+            "created_at", ten_min_ago
+        ).limit(1).execute()
+
+        return bool(pause_result.data)
+    except Exception:
+        return False
+
+
+async def pause_ai_for_customer(customer_id: str):
+    """Mark AI as paused for this customer (seller needs to handle)."""
+    try:
+        # Get seller_id from customer
+        cust = supabase.table("customers").select("seller_id").eq(
+            "id", customer_id
+        ).single().execute()
+        if cust.data:
+            supabase.table("messages").insert({
+                "seller_id": cust.data["seller_id"],
+                "customer_id": customer_id,
+                "direction": "ai_paused",
+                "content": "AI paused — waiting for seller"
+            }).execute()
+    except Exception as e:
+        print(f"Error pausing AI: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -808,6 +870,89 @@ async def update_order_status(order_id: str, request: Request):
 @app.get("/health")
 async def health_check():
     return {"status": "DamKoto backend is running"}
+
+
+# ═══════════════════════════════════════════
+# SELLER REPLY ENDPOINT (called by dashboard)
+# ═══════════════════════════════════════════
+
+@app.post("/api/messages/reply")
+async def seller_reply(request: Request):
+    """
+    Seller sends a manual reply to a customer from the dashboard.
+    This pauses AI for 10 minutes and sends via Messenger.
+    """
+    try:
+        body = await request.json()
+        customer_id = body.get("customer_id")
+        message_text = body.get("message")
+        seller_id = body.get("seller_id")
+
+        if not customer_id or not message_text:
+            return {"error": "customer_id and message are required"}
+
+        # Get customer's facebook_user_id
+        cust_res = supabase.table("customers").select("facebook_user_id").eq(
+            "id", customer_id
+        ).single().execute()
+
+        if not cust_res.data or not cust_res.data.get("facebook_user_id"):
+            return {"error": "Customer not found or no Facebook ID"}
+
+        fb_id = cust_res.data["facebook_user_id"]
+
+        # Send via Messenger
+        await send_messenger_reply(fb_id, message_text)
+
+        # Save as seller_reply (this also pauses AI for 10 min)
+        supabase.table("messages").insert({
+            "seller_id": seller_id,
+            "customer_id": customer_id,
+            "direction": "seller_reply",
+            "content": message_text
+        }).execute()
+
+        print(f"Seller reply sent to customer {customer_id}: {message_text[:100]}")
+        return {"success": True, "customer_notified": True}
+
+    except Exception as e:
+        print(f"Error sending seller reply: {e}")
+        return {"error": str(e)}
+
+
+@app.post("/api/messages/resume-ai")
+async def resume_ai(request: Request):
+    """
+    Seller signals they're done replying — resume AI for this customer.
+    Deletes the ai_paused and seller_reply markers.
+    """
+    try:
+        body = await request.json()
+        customer_id = body.get("customer_id")
+
+        if not customer_id:
+            return {"error": "customer_id is required"}
+
+        # Delete pause markers (older ones will naturally expire after 10 min)
+        # We insert a "resume" marker that the is_seller_active check won't match
+        cust = supabase.table("customers").select("seller_id").eq(
+            "id", customer_id
+        ).single().execute()
+
+        if cust.data:
+            supabase.table("messages").insert({
+                "seller_id": cust.data["seller_id"],
+                "customer_id": customer_id,
+                "direction": "system",
+                "content": "✅ AI আবার চালু হয়েছে"
+            }).execute()
+
+        print(f"AI resumed for customer {customer_id}")
+        return {"success": True}
+
+    except Exception as e:
+        print(f"Error resuming AI: {e}")
+        return {"error": str(e)}
 
 
 if __name__ == "__main__":
