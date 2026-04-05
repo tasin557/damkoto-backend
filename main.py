@@ -706,37 +706,29 @@ async def handle_message(
 
 
 async def is_seller_active(customer_id: str) -> bool:
-    """Check if AI is paused for this customer (seller is handling it)."""
+    """Check if AI is paused for this customer."""
     try:
-        # Check for seller_reply messages in last 10 minutes
-        from datetime import datetime, timedelta, timezone
-        ten_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-
-        result = supabase.table("messages").select("id").eq(
+        # Look for the LATEST ai_paused or ai_resumed message for this customer
+        result = supabase.table("messages").select("direction").eq(
             "customer_id", customer_id
-        ).eq("direction", "seller_reply").gte(
-            "created_at", ten_min_ago
+        ).in_("direction", ["ai_paused", "ai_resumed"]).order(
+            "created_at", desc=True
         ).limit(1).execute()
 
-        if result.data:
-            return True
+        if not result.data:
+            return False
 
-        # Also check if there's a recent AI pause flag
-        pause_result = supabase.table("messages").select("id").eq(
-            "customer_id", customer_id
-        ).eq("direction", "ai_paused").gte(
-            "created_at", ten_min_ago
-        ).limit(1).execute()
-
-        return bool(pause_result.data)
-    except Exception:
+        # If the most recent marker is "ai_paused", AI is paused
+        # If it's "ai_resumed", AI is active
+        return result.data[0]["direction"] == "ai_paused"
+    except Exception as e:
+        print(f"Error checking seller active: {e}")
         return False
 
 
 async def pause_ai_for_customer(customer_id: str):
-    """Mark AI as paused for this customer (seller needs to handle)."""
+    """Mark AI as paused for this customer."""
     try:
-        # Get seller_id from customer
         cust = supabase.table("customers").select("seller_id").eq(
             "id", customer_id
         ).single().execute()
@@ -747,6 +739,7 @@ async def pause_ai_for_customer(customer_id: str):
                 "direction": "ai_paused",
                 "content": "AI paused — waiting for seller"
             }).execute()
+            print(f"AI PAUSED for customer {customer_id}")
     except Exception as e:
         print(f"Error pausing AI: {e}")
 
@@ -920,12 +913,24 @@ async def seller_reply(request: Request):
         return {"error": str(e)}
 
 
+@app.post("/api/messages/pause-ai")
+async def pause_ai_endpoint(request: Request):
+    """Seller manually pauses AI for a customer."""
+    try:
+        body = await request.json()
+        customer_id = body.get("customer_id")
+        if not customer_id:
+            return {"error": "customer_id is required"}
+        await pause_ai_for_customer(customer_id)
+        return {"success": True}
+    except Exception as e:
+        print(f"Error pausing AI: {e}")
+        return {"error": str(e)}
+
+
 @app.post("/api/messages/resume-ai")
 async def resume_ai(request: Request):
-    """
-    Seller signals they're done replying — resume AI for this customer.
-    Deletes the ai_paused and seller_reply markers.
-    """
+    """Seller signals they're done — resume AI for this customer."""
     try:
         body = await request.json()
         customer_id = body.get("customer_id")
@@ -933,21 +938,21 @@ async def resume_ai(request: Request):
         if not customer_id:
             return {"error": "customer_id is required"}
 
-        # Delete pause markers (older ones will naturally expire after 10 min)
-        # We insert a "resume" marker that the is_seller_active check won't match
         cust = supabase.table("customers").select("seller_id").eq(
             "id", customer_id
         ).single().execute()
 
         if cust.data:
+            # Insert ai_resumed marker — is_seller_active checks the LATEST
+            # marker, so this overrides any previous ai_paused
             supabase.table("messages").insert({
                 "seller_id": cust.data["seller_id"],
                 "customer_id": customer_id,
-                "direction": "system",
+                "direction": "ai_resumed",
                 "content": "✅ AI আবার চালু হয়েছে"
             }).execute()
 
-        print(f"AI resumed for customer {customer_id}")
+        print(f"AI RESUMED for customer {customer_id}")
         return {"success": True}
 
     except Exception as e:
