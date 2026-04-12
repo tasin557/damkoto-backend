@@ -2,6 +2,7 @@ from supabase import create_client, Client
 from fastapi import FastAPI, Request
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from datetime import datetime, timezone, timedelta
 import httpx
 import json
 import math
@@ -706,21 +707,69 @@ async def handle_message(
 
 
 async def is_seller_active(customer_id: str) -> bool:
-    """Check if AI is paused for this customer."""
+    """Check if AI is paused for this customer.
+    
+    Logic:
+    1. If no ai_paused/ai_resumed marker exists → AI is active (not paused)
+    2. If latest marker is ai_resumed → AI is active
+    3. If latest marker is ai_paused → check for 24h inactivity:
+       - Find the last message of ANY kind in this conversation
+       - If 24+ hours have passed since that last message → auto-resume AI
+       - Otherwise → AI stays paused
+    """
     try:
-        # Look for the LATEST ai_paused or ai_resumed message for this customer
-        result = supabase.table("messages").select("direction").eq(
+        # Step 1: Check the latest pause/resume marker
+        marker_result = supabase.table("messages").select("direction, created_at").eq(
             "customer_id", customer_id
         ).in_("direction", ["ai_paused", "ai_resumed"]).order(
             "created_at", desc=True
         ).limit(1).execute()
 
-        if not result.data:
+        if not marker_result.data:
             return False
 
-        # If the most recent marker is "ai_paused", AI is paused
-        # If it's "ai_resumed", AI is active
-        return result.data[0]["direction"] == "ai_paused"
+        latest_marker = marker_result.data[0]
+        
+        # If manually resumed, AI is active
+        if latest_marker["direction"] == "ai_resumed":
+            return False
+
+        # AI is paused — check if 24 hours of inactivity has passed
+        # Look at the LAST message of any kind in this conversation
+        last_msg_result = supabase.table("messages").select("created_at").eq(
+            "customer_id", customer_id
+        ).order("created_at", desc=True).limit(1).execute()
+
+        if not last_msg_result.data:
+            return False
+
+        last_activity_str = last_msg_result.data[0]["created_at"]
+        # Parse ISO timestamp from Supabase
+        last_activity = datetime.fromisoformat(last_activity_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        hours_since_last = (now - last_activity).total_seconds() / 3600
+
+        if hours_since_last >= 24:
+            # Auto-resume: 24h of complete inactivity
+            print(f"AUTO-RESUME: 24h inactivity for customer {customer_id} (last activity {hours_since_last:.1f}h ago)")
+            # Insert ai_resumed marker so we don't re-check every time
+            try:
+                cust = supabase.table("customers").select("seller_id").eq(
+                    "id", customer_id
+                ).single().execute()
+                if cust.data:
+                    supabase.table("messages").insert({
+                        "seller_id": cust.data["seller_id"],
+                        "customer_id": customer_id,
+                        "direction": "ai_resumed",
+                        "content": "✅ ২৪ ঘণ্টা নিষ্ক্রিয়তার পরে AI স্বয়ংক্রিয়ভাবে চালু হয়েছে"
+                    }).execute()
+            except Exception as e:
+                print(f"Error inserting auto-resume marker: {e}")
+            return False  # AI is no longer paused
+
+        # Less than 24h since last activity — AI stays paused
+        return True
     except Exception as e:
         print(f"Error checking seller active: {e}")
         return False
