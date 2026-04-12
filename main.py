@@ -706,21 +706,44 @@ async def handle_message(
 
 
 async def is_seller_active(customer_id: str) -> bool:
-    """Check if AI is paused for this customer."""
+    """Check if AI is paused for this customer.
+    AI stays paused until:
+    - An ai_resumed marker is inserted (manual resume), OR
+    - 24 hours have passed since the last ai_paused or seller_reply message
+    The 24h timer resets every time the seller sends a reply.
+    """
     try:
-        # Look for the LATEST ai_paused or ai_resumed message for this customer
-        result = supabase.table("messages").select("direction").eq(
+        from datetime import datetime, timedelta, timezone
+
+        # Find the latest pause/resume/seller_reply marker
+        result = supabase.table("messages").select("direction, created_at").eq(
             "customer_id", customer_id
-        ).in_("direction", ["ai_paused", "ai_resumed"]).order(
+        ).in_("direction", ["ai_paused", "ai_resumed", "seller_reply"]).order(
             "created_at", desc=True
         ).limit(1).execute()
 
         if not result.data:
             return False
 
-        # If the most recent marker is "ai_paused", AI is paused
-        # If it's "ai_resumed", AI is active
-        return result.data[0]["direction"] == "ai_paused"
+        latest = result.data[0]
+
+        # If the most recent marker is ai_resumed, AI is active
+        if latest["direction"] == "ai_resumed":
+            return False
+
+        # If it's ai_paused or seller_reply, check if it's older than 24 hours
+        if latest.get("created_at"):
+            marker_time = datetime.fromisoformat(latest["created_at"].replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            hours_since = (now - marker_time).total_seconds() / 3600
+
+            if hours_since >= 24:
+                # Auto-resume: 24 hours of inactivity
+                print(f"AI AUTO-RESUMED for customer {customer_id} (inactive {hours_since:.1f}h)")
+                return False
+
+        # Still within 24 hours — AI stays paused
+        return True
     except Exception as e:
         print(f"Error checking seller active: {e}")
         return False
